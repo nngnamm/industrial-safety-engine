@@ -64,6 +64,7 @@ message(STATUS "Found ONNX Runtime library: ${ONNXRUNTIME_LIB}")
 add_library(safety_engine_core STATIC
     src/version.cpp
     src/detector.cpp
+    src/geometry.cpp
 )
 
 target_include_directories(safety_engine_core
