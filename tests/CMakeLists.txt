@@ -17,6 +17,12 @@ endif()
 
 add_executable(safety_tests
     test_smoke.cpp
+    test_detector.cpp
+)
+
+target_compile_definitions(safety_tests
+    PRIVATE
+        SAFETY_ENGINE_PROJECT_ROOT="${CMAKE_SOURCE_DIR}"
 )
 
 target_link_libraries(safety_tests
