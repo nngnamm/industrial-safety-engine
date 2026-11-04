@@ -1,0 +1,33 @@
+# CMake & Build Artifacts
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+Testing/
+
+# External Pre-built Binaries
+third_party/
+
+# Compiled Binaries & Libraries
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Model Weights (keep .gitkeep, ignore heavy weights)
+models/*.onnx
+models/*.engine
+models/*.pt
+
+# IDE & OS Files
+.vscode/
+.idea/
+.DS_Store
+*~
