@@ -19,7 +19,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # ------------------------------------------------------------------------------
 
 # 1. OpenCV
-find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui videoio)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui videoio dnn)
 
 # 2. ONNX Runtime (supports -DONNXRUNTIME_ROOT_DIR=... or ENV ONNXRUNTIME_ROOT_DIR)
 set(ONNXRUNTIME_ROOT_DIR "" CACHE PATH "Path to ONNX Runtime installation root directory")
@@ -63,6 +63,7 @@ message(STATUS "Found ONNX Runtime library: ${ONNXRUNTIME_LIB}")
 # ------------------------------------------------------------------------------
 add_library(safety_engine_core STATIC
     src/version.cpp
+    src/detector.cpp
 )
 
 target_include_directories(safety_engine_core
