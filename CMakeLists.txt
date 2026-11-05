@@ -18,10 +18,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Dependencies
 # ------------------------------------------------------------------------------
 
-# 1. OpenCV
+# 1. Threads (C++17 concurrency primitives)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
+# 2. OpenCV
 find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui videoio dnn)
 
-# 2. ONNX Runtime (supports -DONNXRUNTIME_ROOT_DIR=... or ENV ONNXRUNTIME_ROOT_DIR)
+# 3. ONNX Runtime (supports -DONNXRUNTIME_ROOT_DIR=... or ENV ONNXRUNTIME_ROOT_DIR)
 set(ONNXRUNTIME_ROOT_DIR "" CACHE PATH "Path to ONNX Runtime installation root directory")
 
 find_path(ONNXRUNTIME_INCLUDE_DIR
@@ -65,6 +69,7 @@ add_library(safety_engine_core STATIC
     src/version.cpp
     src/detector.cpp
     src/geometry.cpp
+    src/tracker.cpp
 )
 
 target_include_directories(safety_engine_core
@@ -78,6 +83,7 @@ target_link_libraries(safety_engine_core
     PUBLIC
         ${OpenCV_LIBS}
         ${ONNXRUNTIME_LIB}
+        Threads::Threads
 )
 
 target_compile_options(safety_engine_core

@@ -19,6 +19,7 @@ add_executable(safety_tests
     test_smoke.cpp
     test_detector.cpp
     test_geometry.cpp
+    test_tracker_and_queue.cpp
 )
 
 target_compile_definitions(safety_tests
