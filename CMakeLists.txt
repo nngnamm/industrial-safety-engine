@@ -14,6 +14,18 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Export compile_commands.json for clangd / IntelliSense
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# AddressSanitizer & UndefinedBehaviorSanitizer support
+option(ENABLE_ASAN "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+if(ENABLE_ASAN)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        message(STATUS "AddressSanitizer & UndefinedBehaviorSanitizer enabled (-fsanitize=address,undefined)")
+        add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
+        add_link_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
+    else()
+        message(WARNING "ENABLE_ASAN is only supported with GCC or Clang compilers.")
+    endif()
+endif()
+
 # ------------------------------------------------------------------------------
 # Dependencies
 # ------------------------------------------------------------------------------
@@ -70,6 +82,7 @@ add_library(safety_engine_core STATIC
     src/detector.cpp
     src/geometry.cpp
     src/tracker.cpp
+    src/pipeline.cpp
 )
 
 target_include_directories(safety_engine_core
@@ -97,6 +110,11 @@ target_compile_options(safety_engine_core
 # ------------------------------------------------------------------------------
 add_executable(safety_app
     src/main.cpp
+)
+
+target_compile_definitions(safety_app
+    PRIVATE
+        SAFETY_ENGINE_PROJECT_ROOT="${CMAKE_SOURCE_DIR}"
 )
 
 target_link_libraries(safety_app
