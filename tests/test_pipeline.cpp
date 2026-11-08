@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <opencv2/core.hpp>
+#include <opencv2/videoio.hpp>
 #include <vector>
 
 #include "safety_engine/detector.hpp"
@@ -122,4 +123,98 @@ TEST(PipelineTest, MultiThreadedBenchmarkZeroDrops) {
     EXPECT_GT(report.total_frame_stats.mean_ms, 0.0);
     EXPECT_LE(report.total_frame_stats.p50_ms, report.total_frame_stats.p95_ms);
     EXPECT_LE(report.total_frame_stats.p95_ms, report.total_frame_stats.p99_ms);
+}
+
+TEST(PipelineTest, EndToEndVideoFileInference) {
+    const std::filesystem::path model_path = resolve_dummy_model_path();
+    if (!std::filesystem::exists(model_path)) {
+        GTEST_SKIP() << "Skipping video file inference test: " << model_path << " not found.";
+    }
+
+    const std::filesystem::path temp_dir = std::filesystem::temp_directory_path();
+    const std::filesystem::path in_video_path = temp_dir / "safety_engine_test_input.avi";
+    const std::filesystem::path out_video_path = temp_dir / "safety_engine_test_output.avi";
+
+    constexpr int kWidth = 640;
+    constexpr int kHeight = 480;
+    constexpr int kNumFrames = 8;
+    constexpr double kFps = 25.0;
+
+    // 1. Generate temporary synthetic input video via cv::VideoWriter
+    {
+        cv::VideoWriter input_writer(in_video_path.string(),
+                                     cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), kFps,
+                                     cv::Size(kWidth, kHeight));
+        if (!input_writer.isOpened()) {
+            input_writer.open(in_video_path.string(), cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
+                              kFps, cv::Size(kWidth, kHeight));
+        }
+        ASSERT_TRUE(input_writer.isOpened());
+
+        for (int i = 0; i < kNumFrames; ++i) {
+            cv::Mat frame(kHeight, kWidth, CV_8UC3,
+                          cv::Scalar(40 + i * 5, 70 + i * 3, 100 + i * 4));
+            input_writer.write(frame);
+        }
+        input_writer.release();
+    }
+
+    ASSERT_TRUE(std::filesystem::exists(in_video_path));
+    EXPECT_GT(std::filesystem::file_size(in_video_path), 0U);
+
+    // 2. Run SafetyPipeline::run_video_stream end-to-end producing an annotated output video
+    safety_engine::Detector detector(model_path.string(), 0.45f, 0.50f, 640, 640);
+    const safety_engine::SafetyAnalyzer analyzer;
+    safety_engine::WorkerTracker tracker(0.30f, 3, 5);
+    const std::vector<safety_engine::HazardZone> zones = {
+        safety_engine::HazardZone{
+            "VideoTestZone",
+            {{80.0f, 60.0f}, {560.0f, 60.0f}, {560.0f, 440.0f}, {80.0f, 440.0f}},
+            true,
+            true,
+        },
+    };
+    safety_engine::SafetyPipeline pipeline(detector, analyzer, tracker, zones);
+
+    cv::VideoCapture cap(in_video_path.string());
+    ASSERT_TRUE(cap.isOpened());
+
+    cv::VideoWriter output_writer(out_video_path.string(),
+                                  cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), kFps,
+                                  cv::Size(kWidth, kHeight));
+    if (!output_writer.isOpened()) {
+        output_writer.open(out_video_path.string(), cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
+                           kFps, cv::Size(kWidth, kHeight));
+    }
+    ASSERT_TRUE(output_writer.isOpened());
+
+    const safety_engine::BenchmarkReport report =
+        pipeline.run_video_stream(cap, &output_writer, /*max_frames=*/-1, /*queue_capacity=*/4);
+    output_writer.release();
+    cap.release();
+
+    // 3. Verify processed frame count, telemetry stats, and output video validity
+    EXPECT_EQ(report.total_frames, static_cast<std::size_t>(kNumFrames));
+    EXPECT_GT(report.throughput_fps, 0.0);
+    EXPECT_GT(report.detect_stats.mean_ms, 0.0);
+    EXPECT_GT(report.total_frame_stats.mean_ms, 0.0);
+
+    ASSERT_TRUE(std::filesystem::exists(out_video_path));
+    EXPECT_GT(std::filesystem::file_size(out_video_path), 0U);
+
+    cv::VideoCapture verify_cap(out_video_path.string());
+    ASSERT_TRUE(verify_cap.isOpened());
+    int decoded_out_frames = 0;
+    cv::Mat out_frame;
+    while (verify_cap.read(out_frame) && !out_frame.empty()) {
+        EXPECT_EQ(out_frame.cols, kWidth);
+        EXPECT_EQ(out_frame.rows, kHeight);
+        ++decoded_out_frames;
+    }
+    verify_cap.release();
+    EXPECT_EQ(decoded_out_frames, kNumFrames);
+
+    std::error_code ec;
+    std::filesystem::remove(in_video_path, ec);
+    std::filesystem::remove(out_video_path, ec);
 }

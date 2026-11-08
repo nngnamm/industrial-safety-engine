@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <opencv2/core/types.hpp>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -212,9 +215,11 @@ TEST(GeometryTest, HomographyGroundPlaneProjection) {
 
     // Verify all 4 corners project accurately to the metric square in ground coordinates
     for (std::size_t i = 0; i < 4U; ++i) {
-        const cv::Point2f projected = safety_engine::project_point_homography(image_quad[i], H);
-        EXPECT_NEAR(projected.x, ground_square[i].x, 1e-3f);
-        EXPECT_NEAR(projected.y, ground_square[i].y, 1e-3f);
+        const std::optional<cv::Point2f> projected =
+            safety_engine::project_point_homography(image_quad[i], H);
+        ASSERT_TRUE(projected.has_value());
+        EXPECT_NEAR(projected->x, ground_square[i].x, 1e-3f);
+        EXPECT_NEAR(projected->y, ground_square[i].y, 1e-3f);
     }
 
     // Define a calibrated ground-plane HazardZone covering the metric square [0, 10] x [0, 10]
@@ -242,13 +247,17 @@ TEST(GeometryTest, HomographyGroundPlaneProjection) {
 
     EXPECT_FLOAT_EQ(calibrated_statuses[0].feet_point.x, 500.0f);
     EXPECT_FLOAT_EQ(calibrated_statuses[0].feet_point.y, 400.0f);
-    EXPECT_NEAR(calibrated_statuses[0].ground_point.x, 5.0f, 1e-3f);
-    EXPECT_GT(calibrated_statuses[0].ground_point.y, 0.0f);
-    EXPECT_LT(calibrated_statuses[0].ground_point.y, 10.0f);
+    EXPECT_TRUE(calibrated_statuses[0].ground_projection_valid);
+    ASSERT_TRUE(calibrated_statuses[0].ground_point.has_value());
+    EXPECT_NEAR(calibrated_statuses[0].ground_point->x, 5.0f, 1e-3f);
+    EXPECT_GT(calibrated_statuses[0].ground_point->y, 0.0f);
+    EXPECT_LT(calibrated_statuses[0].ground_point->y, 10.0f);
     EXPECT_TRUE(calibrated_statuses[0].in_hazard_zone);
     EXPECT_TRUE(calibrated_statuses[0].is_violating);
 
-    EXPECT_LT(calibrated_statuses[1].ground_point.x, 0.0f);
+    EXPECT_TRUE(calibrated_statuses[1].ground_projection_valid);
+    ASSERT_TRUE(calibrated_statuses[1].ground_point.has_value());
+    EXPECT_LT(calibrated_statuses[1].ground_point->x, 0.0f);
     EXPECT_FALSE(calibrated_statuses[1].in_hazard_zone);
     EXPECT_FALSE(calibrated_statuses[1].is_violating);
 
@@ -258,5 +267,54 @@ TEST(GeometryTest, HomographyGroundPlaneProjection) {
     const std::vector<WorkerStatus> uncalibrated_statuses =
         analyzer.analyze_frame({worker_inside}, {metric_zone});
     ASSERT_EQ(uncalibrated_statuses.size(), 1U);
-    EXPECT_EQ(uncalibrated_statuses[0].ground_point, uncalibrated_statuses[0].feet_point);
+    EXPECT_TRUE(uncalibrated_statuses[0].ground_projection_valid);
+    ASSERT_TRUE(uncalibrated_statuses[0].ground_point.has_value());
+    EXPECT_EQ(*uncalibrated_statuses[0].ground_point, uncalibrated_statuses[0].feet_point);
+}
+
+TEST(GeometryTest, DegenerateHomographyAndHorizonPointHandling) {
+    SafetyAnalyzer analyzer;
+
+    // 1. Singular zero matrix must be rejected by set_homography
+    const cv::Matx33f zero_H = cv::Matx33f::zeros();
+    EXPECT_THROW(analyzer.set_homography(zero_H), std::invalid_argument);
+
+    // 2. Non-finite matrix must be rejected by set_homography
+    cv::Matx33f nan_H = cv::Matx33f::eye();
+    nan_H(0, 0) = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_THROW(analyzer.set_homography(nan_H), std::invalid_argument);
+
+    // 3. Invertible homography with a horizon line at y = 100 (w = 0.01 * y - 1.0 == 0 at y = 100)
+    const cv::Matx33f horizon_H(1.0f, 0.0f, 0.0f,
+                                0.0f, 1.0f, 0.0f,
+                                0.0f, 0.01f, -1.0f);
+    EXPECT_NO_THROW(analyzer.set_homography(horizon_H));
+
+    // Point on the horizon (w -> 0) must return std::nullopt, never raw pixel coordinates
+    const cv::Point2f horizon_pt(50.0f, 100.0f);
+    const std::optional<cv::Point2f> projected =
+        safety_engine::project_point_homography(horizon_pt, horizon_H);
+    EXPECT_FALSE(projected.has_value());
+
+    // Define a ground-plane HazardZone that deliberately covers raw pixel coordinates (50, 100).
+    // Because homography projection fails at y = 100, analyze_frame must mark
+    // ground_projection_valid = false and skip hazard-zone evaluation rather than matching (50, 100).
+    const HazardZone ground_zone{
+        "MetricGroundZone",
+        {{0.0f, 0.0f}, {200.0f, 0.0f}, {200.0f, 200.0f}, {0.0f, 200.0f}},
+        /*require_helmet=*/true,
+        /*require_vest=*/true,
+    };
+    const Detection horizon_worker{cv::Rect2f(10.0f, 0.0f, 80.0f, 100.0f), 0.95f,
+                                   static_cast<int>(ClassId::Person)};
+
+    const std::vector<WorkerStatus> statuses =
+        analyzer.analyze_frame({horizon_worker}, {ground_zone});
+    ASSERT_EQ(statuses.size(), 1U);
+    EXPECT_FLOAT_EQ(statuses[0].feet_point.x, 50.0f);
+    EXPECT_FLOAT_EQ(statuses[0].feet_point.y, 100.0f);
+    EXPECT_FALSE(statuses[0].ground_projection_valid);
+    EXPECT_FALSE(statuses[0].ground_point.has_value());
+    EXPECT_FALSE(statuses[0].in_hazard_zone);
+    EXPECT_FALSE(statuses[0].is_violating);
 }

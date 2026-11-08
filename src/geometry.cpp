@@ -6,17 +6,18 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <stdexcept>
+#include <tuple>
 
 namespace safety_engine {
 
 namespace {
 
 constexpr float kAreaEpsilon = 1e-6f;
-constexpr float kScoreTieEpsilon = 1e-6f;
+constexpr double kMinHomographyDet = 1e-9;
 
 struct PPEAssignmentCandidate {
-    std::size_t person_index;
-    std::size_t ppe_index;
+    std::size_t person_idx;
+    std::size_t ppe_idx;
     float score;
     float ppe_confidence;
 };
@@ -80,30 +81,25 @@ void assign_ppe_one_to_one(const std::vector<const Detection*>& persons,
 
     std::sort(candidates.begin(), candidates.end(),
               [](const PPEAssignmentCandidate& lhs, const PPEAssignmentCandidate& rhs) {
-                  if (std::abs(lhs.score - rhs.score) > kScoreTieEpsilon) {
+                  if (lhs.score != rhs.score) {
                       return lhs.score > rhs.score;
                   }
-                  if (std::abs(lhs.ppe_confidence - rhs.ppe_confidence) > kScoreTieEpsilon) {
-                      return lhs.ppe_confidence > rhs.ppe_confidence;
-                  }
-                  if (lhs.person_index != rhs.person_index) {
-                      return lhs.person_index < rhs.person_index;
-                  }
-                  return lhs.ppe_index < rhs.ppe_index;
+                  return std::tie(lhs.person_idx, lhs.ppe_idx) <
+                         std::tie(rhs.person_idx, rhs.ppe_idx);
               });
 
     std::vector<bool> person_claimed(persons.size(), false);
     std::vector<bool> ppe_claimed(ppe_items.size(), false);
 
     for (const PPEAssignmentCandidate& cand : candidates) {
-        if (person_claimed[cand.person_index] || ppe_claimed[cand.ppe_index]) {
+        if (person_claimed[cand.person_idx] || ppe_claimed[cand.ppe_idx]) {
             continue;
         }
-        person_claimed[cand.person_index] = true;
-        ppe_claimed[cand.ppe_index] = true;
+        person_claimed[cand.person_idx] = true;
+        ppe_claimed[cand.ppe_idx] = true;
 
-        WorkerStatus& status = results[cand.person_index];
-        const cv::Rect2f& matched_box = ppe_items[cand.ppe_index]->bbox;
+        WorkerStatus& status = results[cand.person_idx];
+        const cv::Rect2f& matched_box = ppe_items[cand.ppe_idx]->bbox;
         if (is_helmet) {
             status.helmet_bbox = matched_box;
             status.has_helmet = true;
@@ -111,6 +107,22 @@ void assign_ppe_one_to_one(const std::vector<const Detection*>& persons,
             status.vest_bbox = matched_box;
             status.has_vest = true;
         }
+    }
+}
+
+void validate_homography_matrix(const cv::Matx33f& H, const char* caller) {
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            if (!std::isfinite(H(r, c))) {
+                throw std::invalid_argument(std::string(caller) +
+                                            ": homography matrix contains non-finite entries.");
+            }
+        }
+    }
+    const double det = cv::determinant(H);
+    if (!std::isfinite(det) || std::abs(det) <= kMinHomographyDet) {
+        throw std::invalid_argument(std::string(caller) +
+                                    ": homography matrix is singular or degenerate.");
     }
 }
 
@@ -168,10 +180,20 @@ cv::Matx33f compute_ground_homography(const std::array<cv::Point2f, 4>& image_po
             "compute_ground_homography: failed to solve 3x3 perspective transform.");
     }
 
+    const double w0 = h64.at<double>(2, 0);
+    const double w1 = h64.at<double>(2, 1);
+    const double w2 = h64.at<double>(2, 2);
+    const double row2_norm = std::sqrt(w0 * w0 + w1 * w1 + w2 * w2);
+    if (!std::isfinite(row2_norm) || row2_norm <= kMinHomographyDet) {
+        throw std::invalid_argument(
+            "compute_ground_homography: degenerate point configuration produced invalid "
+            "homography.");
+    }
+
     cv::Matx33f H;
     for (int r = 0; r < 3; ++r) {
         for (int c = 0; c < 3; ++c) {
-            const double val = h64.at<double>(r, c);
+            const double val = h64.at<double>(r, c) / row2_norm;
             if (!std::isfinite(val)) {
                 throw std::invalid_argument(
                     "compute_ground_homography: degenerate point configuration produced non-finite "
@@ -180,17 +202,24 @@ cv::Matx33f compute_ground_homography(const std::array<cv::Point2f, 4>& image_po
             H(r, c) = static_cast<float>(val);
         }
     }
+    validate_homography_matrix(H, "compute_ground_homography");
     return H;
 }
 
-cv::Point2f project_point_homography(const cv::Point2f& pt, const cv::Matx33f& H) noexcept {
+std::optional<cv::Point2f> project_point_homography(const cv::Point2f& pt,
+                                                    const cv::Matx33f& H) noexcept {
     const float x = H(0, 0) * pt.x + H(0, 1) * pt.y + H(0, 2);
     const float y = H(1, 0) * pt.x + H(1, 1) * pt.y + H(1, 2);
     const float w = H(2, 0) * pt.x + H(2, 1) * pt.y + H(2, 2);
-    if (std::abs(w) <= kAreaEpsilon) {
-        return pt;
+    if (!std::isfinite(w) || std::abs(w) <= 1e-6f) {
+        return std::nullopt;
     }
-    return cv::Point2f(x / w, y / w);
+    const float proj_x = x / w;
+    const float proj_y = y / w;
+    if (std::isnan(proj_x) || std::isinf(proj_x) || std::isnan(proj_y) || std::isinf(proj_y)) {
+        return std::nullopt;
+    }
+    return cv::Point2f(proj_x, proj_y);
 }
 
 SafetyAnalyzer::SafetyAnalyzer(float ppe_containment_thresh, float helmet_max_rel_y,
@@ -212,7 +241,8 @@ SafetyAnalyzer::SafetyAnalyzer(float ppe_containment_thresh, float helmet_max_re
     }
 }
 
-void SafetyAnalyzer::set_homography(const cv::Matx33f& H) noexcept {
+void SafetyAnalyzer::set_homography(const cv::Matx33f& H) {
+    validate_homography_matrix(H, "SafetyAnalyzer::set_homography");
     homography_ = H;
 }
 
@@ -254,13 +284,24 @@ std::vector<WorkerStatus> SafetyAnalyzer::analyze_frame(
         status.person_bbox = person_det->bbox;
         status.person_confidence = person_det->confidence;
         status.feet_point = compute_feet_point(status.person_bbox);
-        status.ground_point = homography_.has_value()
-                                  ? project_point_homography(status.feet_point, *homography_)
-                                  : status.feet_point;
+        if (homography_.has_value()) {
+            const std::optional<cv::Point2f> projected =
+                project_point_homography(status.feet_point, *homography_);
+            if (projected.has_value()) {
+                status.ground_projection_valid = true;
+                status.ground_point = *projected;
+            } else {
+                status.ground_projection_valid = false;
+                status.ground_point = std::nullopt;
+            }
+        } else {
+            status.ground_projection_valid = true;
+            status.ground_point = status.feet_point;
+        }
         results.push_back(std::move(status));
     }
 
-    // Exclusive 1-to-1 bipartite assignment for helmets and vests
+    // Greedy 1-to-1 containment assignment for helmets and vests
     assign_ppe_one_to_one(persons, helmets, 0.0f, helmet_max_rel_y_, ppe_containment_thresh_,
                           /*is_helmet=*/true, results);
     assign_ppe_one_to_one(persons, vests, vest_min_rel_y_, vest_max_rel_y_, ppe_containment_thresh_,
@@ -268,8 +309,11 @@ std::vector<WorkerStatus> SafetyAnalyzer::analyze_frame(
 
     // Evaluate hazard zone compliance in ground-plane coordinates (defaults to feet_point)
     for (WorkerStatus& status : results) {
+        if (!status.ground_projection_valid || !status.ground_point.has_value()) {
+            continue;
+        }
         for (const HazardZone& zone : hazard_zones) {
-            if (is_point_in_polygon(status.ground_point, zone.polygon)) {
+            if (is_point_in_polygon(*status.ground_point, zone.polygon)) {
                 status.in_hazard_zone = true;
                 const bool missing_helmet = zone.require_helmet && !status.has_helmet;
                 const bool missing_vest = zone.require_vest && !status.has_vest;

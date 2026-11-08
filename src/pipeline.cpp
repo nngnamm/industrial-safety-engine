@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iomanip>
 #include <numeric>
 #include <opencv2/imgproc.hpp>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -362,6 +364,125 @@ BenchmarkReport SafetyPipeline::run_multithreaded_benchmark(int num_frames, int 
     BenchmarkReport report;
     report.total_frames = total_ms.size();
     report.warmup_frames = static_cast<std::size_t>(warmup_frames);
+    report.detect_stats = compute_latency_stats(std::move(detect_ms));
+    report.geometry_stats = compute_latency_stats(std::move(geometry_ms));
+    report.tracker_stats = compute_latency_stats(std::move(tracker_ms));
+    report.total_frame_stats = compute_latency_stats(std::move(total_ms));
+    report.throughput_fps =
+        (wall_seconds > 0.0) ? (static_cast<double>(report.total_frames) / wall_seconds) : 0.0;
+
+    return report;
+}
+
+BenchmarkReport SafetyPipeline::run_video_stream(cv::VideoCapture& cap, cv::VideoWriter* writer,
+                                                 int max_frames, std::size_t queue_capacity) {
+    if (!cap.isOpened()) {
+        throw std::invalid_argument(
+            "SafetyPipeline::run_video_stream: cv::VideoCapture is not opened.");
+    }
+    if (queue_capacity == 0U) {
+        throw std::invalid_argument(
+            "SafetyPipeline::run_video_stream: queue_capacity must be > 0.");
+    }
+    if (writer != nullptr && !writer->isOpened()) {
+        throw std::invalid_argument(
+            "SafetyPipeline::run_video_stream: cv::VideoWriter is not opened.");
+    }
+
+    tracker_.reset();
+
+    BoundedQueue<cv::Mat> frame_queue(queue_capacity);
+
+    std::vector<double> detect_ms;
+    std::vector<double> geometry_ms;
+    std::vector<double> tracker_ms;
+    std::vector<double> total_ms;
+    if (max_frames > 0) {
+        const auto reserve_n = static_cast<std::size_t>(max_frames);
+        detect_ms.reserve(reserve_n);
+        geometry_ms.reserve(reserve_n);
+        tracker_ms.reserve(reserve_n);
+        total_ms.reserve(reserve_n);
+    }
+
+    using Clock = std::chrono::steady_clock;
+    using Millis = std::chrono::duration<double, std::milli>;
+
+    const Clock::time_point wall_start = Clock::now();
+
+    std::thread producer([&cap, &frame_queue, max_frames]() {
+        int decoded = 0;
+        while (max_frames < 0 || decoded < max_frames) {
+            cv::Mat frame;
+            if (!cap.read(frame) || frame.empty()) {
+                break;
+            }
+            if (!frame_queue.push(frame.clone())) {
+                break;
+            }
+            ++decoded;
+        }
+        frame_queue.close();
+    });
+
+    try {
+        while (true) {
+            std::optional<cv::Mat> frame_opt = frame_queue.pop();
+            if (!frame_opt.has_value()) {
+                break;
+            }
+
+            cv::Mat& frame = *frame_opt;
+            const Clock::time_point t0 = Clock::now();
+            const std::vector<Detection> detections = detector_.detect(frame);
+            const Clock::time_point t1 = Clock::now();
+            const std::vector<WorkerStatus> statuses =
+                analyzer_.analyze_frame(detections, hazard_zones_);
+            const Clock::time_point t2 = Clock::now();
+            const std::vector<TrackedWorker> tracked = tracker_.update(statuses);
+            const Clock::time_point t3 = Clock::now();
+
+            const double d_ms = Millis(t1 - t0).count();
+            const double g_ms = Millis(t2 - t1).count();
+            const double tr_ms = Millis(t3 - t2).count();
+            const double tot_ms = Millis(t3 - t0).count();
+
+            detect_ms.push_back(d_ms);
+            geometry_ms.push_back(g_ms);
+            tracker_ms.push_back(tr_ms);
+            total_ms.push_back(tot_ms);
+
+            const double inst_fps = (tot_ms > 1e-6) ? (1000.0 / tot_ms) : 0.0;
+            std::ostringstream telem;
+            telem << std::fixed << std::setprecision(2) << "ONNX: " << d_ms
+                  << " ms | Geometry: " << std::setprecision(3) << g_ms
+                  << " ms | Tracker: " << tr_ms << " ms | " << std::setprecision(1) << inst_fps
+                  << " FPS";
+
+            render_hud(frame, hazard_zones_, tracked, telem.str());
+
+            if (writer != nullptr) {
+                writer->write(frame);
+            }
+        }
+    } catch (...) {
+        frame_queue.close();
+        if (producer.joinable()) {
+            producer.join();
+        }
+        throw;
+    }
+
+    if (producer.joinable()) {
+        producer.join();
+    }
+
+    const Clock::time_point wall_end = Clock::now();
+    const double wall_seconds = std::chrono::duration<double>(wall_end - wall_start).count();
+
+    BenchmarkReport report;
+    report.total_frames = total_ms.size();
+    report.warmup_frames = 0U;
     report.detect_stats = compute_latency_stats(std::move(detect_ms));
     report.geometry_stats = compute_latency_stats(std::move(geometry_ms));
     report.tracker_stats = compute_latency_stats(std::move(tracker_ms));

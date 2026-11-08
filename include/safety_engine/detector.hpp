@@ -14,6 +14,8 @@ namespace safety_engine {
 
 class Detector {
    public:
+    static constexpr int64_t kExpectedNumClasses = 3;
+
     explicit Detector(const std::string& model_path, float conf_threshold = 0.45f,
                       float iou_threshold = 0.50f, int input_width = 640,
                       int input_height = 640);

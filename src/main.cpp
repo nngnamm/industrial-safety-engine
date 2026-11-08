@@ -1,5 +1,7 @@
 #include <onnxruntime_cxx_api.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -10,6 +12,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -45,8 +48,11 @@ struct CliOptions {
     bool benchmark_explicitly_set{false};
     bool model_explicitly_set{false};
     std::string model_path;
+    std::string video_source;
+    std::string output_video_path;
     std::string save_hud_path;
     std::string export_demo_dir;
+    int max_frames{-1};
     int num_frames{50};
     int warmup_frames{10};
     int width{1920};
@@ -76,6 +82,11 @@ void print_usage(const char* prog_name) {
               << "Options:\n"
               << "  --benchmark               Run multi-threaded synthetic latency benchmark "
                  "(default)\n"
+              << "  --video <path_or_index>   Run end-to-end inference on a video file (.mp4/.avi) "
+                 "or camera index (e.g., 0)\n"
+              << "  --output <path>           Write HUD-annotated output video (.mp4/.avi) during "
+                 "--video inference\n"
+              << "  --max-frames <N>          Optional maximum frame limit for --video inference\n"
               << "  --model <path>            Path to ONNX model (default: "
                  "models/dummy_yolo.onnx;\n"
               << "                            use models/yolov8n_bench.onnx for Conv2D NN "
@@ -108,6 +119,11 @@ int parse_non_negative_int(const std::string& flag, const std::string& raw) {
     return value;
 }
 
+bool is_camera_index_string(const std::string& s) {
+    return !s.empty() &&
+           std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
+}
+
 CliOptions parse_args(int argc, char* argv[], bool& help_requested) {
     CliOptions opts;
     opts.model_path = resolve_default_model_path();
@@ -121,6 +137,21 @@ CliOptions parse_args(int argc, char* argv[], bool& help_requested) {
         if (arg == "--benchmark") {
             opts.run_benchmark = true;
             opts.benchmark_explicitly_set = true;
+        } else if (arg == "--video") {
+            if (i + 1 >= argc) {
+                throw std::invalid_argument("Missing argument for --video");
+            }
+            opts.video_source = argv[++i];
+        } else if (arg == "--output") {
+            if (i + 1 >= argc) {
+                throw std::invalid_argument("Missing argument for --output");
+            }
+            opts.output_video_path = argv[++i];
+        } else if (arg == "--max-frames") {
+            if (i + 1 >= argc) {
+                throw std::invalid_argument("Missing argument for --max-frames");
+            }
+            opts.max_frames = parse_positive_int("--max-frames", argv[++i]);
         } else if (arg == "--model") {
             if (i + 1 >= argc) {
                 throw std::invalid_argument("Missing argument for --model");
@@ -168,7 +199,8 @@ CliOptions parse_args(int argc, char* argv[], bool& help_requested) {
         }
     }
 
-    if (!opts.export_demo_dir.empty() && !opts.benchmark_explicitly_set) {
+    if ((!opts.export_demo_dir.empty() || !opts.video_source.empty()) &&
+        !opts.benchmark_explicitly_set) {
         opts.run_benchmark = false;
     }
 
@@ -480,13 +512,13 @@ int main(int argc, char* argv[]) {
             if (!export_demo_sequence(opts.export_demo_dir)) {
                 return EXIT_FAILURE;
             }
-            if (!opts.run_benchmark && opts.save_hud_path.empty()) {
+            if (!opts.run_benchmark && opts.video_source.empty() && opts.save_hud_path.empty()) {
                 return EXIT_SUCCESS;
             }
         }
 
         if (!std::filesystem::exists(opts.model_path)) {
-            if (opts.model_explicitly_set) {
+            if (opts.model_explicitly_set || !opts.video_source.empty()) {
                 std::cerr << "Error: ONNX model not found at '" << opts.model_path << "'.\n";
                 return EXIT_FAILURE;
             }
@@ -500,6 +532,74 @@ int main(int argc, char* argv[]) {
         safety_engine::Detector detector(opts.model_path, 0.45f, 0.50f, 640, 640);
         const safety_engine::SafetyAnalyzer analyzer;
         safety_engine::WorkerTracker tracker(0.30f, 3, 5);
+
+        if (!opts.video_source.empty()) {
+            cv::VideoCapture cap;
+            if (is_camera_index_string(opts.video_source)) {
+                cap.open(std::stoi(opts.video_source));
+            } else {
+                cap.open(opts.video_source);
+            }
+            if (!cap.isOpened()) {
+                std::cerr << "Error: Failed to open video source '" << opts.video_source << "'.\n";
+                return EXIT_FAILURE;
+            }
+
+            int vid_w = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+            int vid_h = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+            double fps = cap.get(cv::CAP_PROP_FPS);
+            if (vid_w <= 0) {
+                vid_w = opts.width;
+            }
+            if (vid_h <= 0) {
+                vid_h = opts.height;
+            }
+            if (!std::isfinite(fps) || fps <= 0.0) {
+                fps = 30.0;
+            }
+
+            cv::VideoWriter writer;
+            cv::VideoWriter* writer_ptr = nullptr;
+            if (!opts.output_video_path.empty()) {
+                const auto parent_dir = std::filesystem::path(opts.output_video_path).parent_path();
+                if (!parent_dir.empty()) {
+                    std::filesystem::create_directories(parent_dir);
+                }
+                if (!writer.open(opts.output_video_path,
+                                 cv::VideoWriter::fourcc('m', 'p', '4', 'v'), fps,
+                                 cv::Size(vid_w, vid_h))) {
+                    writer.open(opts.output_video_path, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'),
+                                fps, cv::Size(vid_w, vid_h));
+                }
+                if (!writer.isOpened()) {
+                    std::cerr << "Error: Failed to open output video writer at '"
+                              << opts.output_video_path << "'.\n";
+                    return EXIT_FAILURE;
+                }
+                writer_ptr = &writer;
+            }
+
+            const std::vector<safety_engine::HazardZone> video_zones =
+                make_default_hazard_zones(vid_w, vid_h);
+            safety_engine::SafetyPipeline video_pipeline(detector, analyzer, tracker, video_zones);
+
+            std::cout << "Running video stream inference on '" << opts.video_source << "' ("
+                      << vid_w << "x" << vid_h << " @ " << std::fixed << std::setprecision(1) << fps
+                      << " FPS)...\n";
+            const safety_engine::BenchmarkReport video_report = video_pipeline.run_video_stream(
+                cap, writer_ptr, opts.max_frames, opts.queue_capacity);
+
+            CliOptions report_opts = opts;
+            report_opts.width = vid_w;
+            report_opts.height = vid_h;
+            print_benchmark_table(video_report, report_opts);
+
+            if (writer_ptr != nullptr) {
+                writer.release();
+                std::cout << "Saved annotated output video to: " << opts.output_video_path << '\n';
+            }
+        }
+
         const std::vector<safety_engine::HazardZone> zones =
             make_default_hazard_zones(opts.width, opts.height);
 

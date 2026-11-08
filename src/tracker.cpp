@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 #include "safety_engine/geometry.hpp"
@@ -12,7 +13,6 @@ namespace safety_engine {
 
 namespace {
 
-constexpr float kIoUTieEpsilon = 1e-6f;
 constexpr float kVelocitySmoothingAlpha = 0.70f;
 
 struct CandidateMatch {
@@ -52,13 +52,11 @@ void sort_and_assign_stage(const std::vector<TrackedWorker>& tracks,
 
     std::sort(candidates.begin(), candidates.end(),
               [](const CandidateMatch& lhs, const CandidateMatch& rhs) {
-                  if (std::abs(lhs.iou - rhs.iou) > kIoUTieEpsilon) {
+                  if (lhs.iou != rhs.iou) {
                       return lhs.iou > rhs.iou;
                   }
-                  if (lhs.track_idx != rhs.track_idx) {
-                      return lhs.track_idx < rhs.track_idx;
-                  }
-                  return lhs.worker_idx < rhs.worker_idx;
+                  return std::tie(lhs.track_idx, lhs.worker_idx) <
+                         std::tie(rhs.track_idx, rhs.worker_idx);
               });
 
     for (const CandidateMatch& match : candidates) {

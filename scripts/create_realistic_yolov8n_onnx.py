@@ -20,10 +20,10 @@ Graph architecture (input [1, 3, 640, 640] -> output [1, 7, 8400]):
       Concat([P3, P4, P5], axis=2) + Anchor Prior -> output0 [1, 7, 8400]
 
 Supports:
-  1. Exporting via `ultralytics` if installed and `--use-ultralytics` is passed.
-  2. `onnx.helper` graph builder if the `onnx` Python package is installed.
-  3. Zero-dependency pure-Python ONNX Protobuf wire serializer fallback so it works
-     out-of-the-box without PyTorch or external pip packages.
+  1. Exporting a custom-trained 3-class PPE Ultralytics checkpoint via `--weights <ppe_yolov8n.pt>`,
+     strictly validating that `model.names` matches the 3-class `{0: Person, 1: Helmet, 2: Vest}` contract.
+  2. Zero-dependency pure-Python ONNX Protobuf wire serializer producing a 3-class
+     multi-layer Conv2D + SiLU + SPPF + Detect benchmark graph out-of-the-box.
 """
 
 from __future__ import annotations
@@ -349,21 +349,41 @@ def _build_realistic_yolov8n_wire(output_path: Path) -> None:
     output_path.write_bytes(model_msg)
 
 
-def _try_export_ultralytics(output_path: Path) -> bool:
-    try:
-        from ultralytics import YOLO  # type: ignore
+EXPECTED_PPE_CLASS_NAMES = {0: "person", 1: "helmet", 2: "vest"}
 
-        model = YOLO("yolov8n.pt")
-        exported = Path(model.export(format="onnx", imgsz=640))
-        output_path.write_bytes(exported.read_bytes())
-        return True
-    except Exception:
-        return False
+
+def _export_validated_ultralytics_ppe(weights_path: Path, output_path: Path) -> None:
+    if not weights_path.exists():
+        raise FileNotFoundError(f"Checkpoint file not found: {weights_path}")
+
+    from ultralytics import YOLO  # type: ignore
+
+    model = YOLO(str(weights_path))
+    raw_names = getattr(model, "names", None)
+    if isinstance(raw_names, list):
+        names_dict = {idx: str(name).strip().lower() for idx, name in enumerate(raw_names)}
+    elif isinstance(raw_names, dict):
+        names_dict = {int(idx): str(name).strip().lower() for idx, name in raw_names.items()}
+    else:
+        raise ValueError(
+            f"Model '{weights_path}' does not expose a valid 'names' mapping."
+        )
+
+    if names_dict != EXPECTED_PPE_CLASS_NAMES:
+        raise ValueError(
+            f"Invalid checkpoint class contract in '{weights_path}': got model.names={raw_names}, "
+            "but safety_engine requires an exact 3-class PPE model "
+            "{0: 'Person', 1: 'Helmet', 2: 'Vest'} (output shape [1, 7, 8400]). "
+            "Generic 80-class COCO checkpoints (e.g. yolov8n.pt) are not permitted."
+        )
+
+    exported = Path(model.export(format="onnx", imgsz=640))
+    output_path.write_bytes(exported.read_bytes())
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate realistic multi-layer Conv2D YOLOv8-Nano benchmark ONNX graph."
+        description="Generate realistic multi-layer Conv2D YOLOv8-Nano 3-class PPE ONNX graph."
     )
     parser.add_argument(
         "--output",
@@ -372,16 +392,19 @@ def main() -> None:
         help="Destination ONNX file path (default: models/yolov8n_bench.onnx)",
     )
     parser.add_argument(
-        "--use-ultralytics",
-        action="store_true",
-        help="Attempt to export via ultralytics if installed before falling back to pure-ONNX Conv2D builder.",
+        "--weights",
+        type=Path,
+        default=None,
+        help="Optional path to a trained 3-class PPE Ultralytics .pt checkpoint "
+        "({0: Person, 1: Helmet, 2: Vest}) to export to ONNX.",
     )
     args = parser.parse_args()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.use_ultralytics and _try_export_ultralytics(args.output):
-        backend = "ultralytics YOLOv8n export"
+    if args.weights is not None:
+        _export_validated_ultralytics_ppe(args.weights, args.output)
+        backend = f"ultralytics 3-class PPE export from {args.weights}"
     else:
         _build_realistic_yolov8n_wire(args.output)
         backend = "multi-layer Conv2D + SiLU + SPPF + Detect ONNX graph builder"

@@ -21,14 +21,15 @@ bool is_point_in_polygon(const cv::Point2f& pt, const std::vector<cv::Point2f>& 
 cv::Matx33f compute_ground_homography(const std::array<cv::Point2f, 4>& image_points,
                                       const std::array<cv::Point2f, 4>& ground_points);
 
-cv::Point2f project_point_homography(const cv::Point2f& pt, const cv::Matx33f& H) noexcept;
+std::optional<cv::Point2f> project_point_homography(const cv::Point2f& pt,
+                                                    const cv::Matx33f& H) noexcept;
 
 class SafetyAnalyzer {
    public:
     explicit SafetyAnalyzer(float ppe_containment_thresh = 0.60f, float helmet_max_rel_y = 0.35f,
                             float vest_min_rel_y = 0.15f, float vest_max_rel_y = 0.75f);
 
-    void set_homography(const cv::Matx33f& H) noexcept;
+    void set_homography(const cv::Matx33f& H);
 
     void clear_homography() noexcept;
 

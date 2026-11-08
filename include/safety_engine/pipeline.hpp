@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <opencv2/core.hpp>
+#include <opencv2/videoio.hpp>
 #include <string>
 #include <vector>
 
@@ -49,6 +50,9 @@ class SafetyPipeline {
     BenchmarkReport run_multithreaded_benchmark(int num_frames = 100, int width = 1920,
                                                 int height = 1080, std::size_t queue_capacity = 8,
                                                 int warmup_frames = 10);
+
+    BenchmarkReport run_video_stream(cv::VideoCapture& cap, cv::VideoWriter* writer = nullptr,
+                                     int max_frames = -1, std::size_t queue_capacity = 8);
 
     const std::vector<HazardZone>& hazard_zones() const noexcept { return hazard_zones_; }
 

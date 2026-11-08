@@ -4,7 +4,7 @@
 
 # Real-Time Industrial Worker Safety & Hazard Zone Analytics Engine
 
-An embedded-ready, zero-overhead **C++17** computer vision and spatial-temporal safety analytics engine built on **ONNX Runtime** and **OpenCV 4**. Designed for industrial edge deployments (manufacturing presses, high-voltage bays, automated logistics corridors), the engine performs multi-class PPE detection, anatomical spatial association, polygonal hazard-zone compliance checking, multi-object IoU tracking, and consecutive-frame violation de-bouncing across a lock-minimal Producer-Consumer pipeline.
+An edge-oriented C++17 prototype for computer vision and spatial-temporal safety analytics built on **ONNX Runtime** and **OpenCV 4**. Designed for industrial monitoring workflows (manufacturing presses, high-voltage bays, automated logistics corridors), the engine features pre-allocated contiguous buffer preprocessing, multi-class PPE detection, greedy 1-to-1 containment assignment, polygonal hazard-zone compliance checking with explicit homography validation, a ByteTrack-inspired two-stage confidence tracker with constant-velocity alpha-beta prediction, and consecutive-frame violation de-bouncing across a Producer-Consumer pipeline.
 
 ---
 
@@ -12,25 +12,25 @@ An embedded-ready, zero-overhead **C++17** computer vision and spatial-temporal 
 
 ```mermaid
 flowchart LR
-    Cam["Frame Producer Thread\n(Camera / Synthetic Stream)"] -->|"std::move(cv::Mat)"| Queue["BoundedQueue&lt;cv::Mat&gt;\n(std::mutex + condition_variable)"]
-    Queue -->|"Zero-Copy Tensor View"| Det["ONNX Detector\n(Letterbox + YOLOv8 NMS)"]
-    Det -->|"std::vector&lt;Detection&gt;"| Geo["Spatial SafetyAnalyzer\n(Anatomical IoPA + Point-in-Polygon)"]
-    Geo -->|"std::vector&lt;WorkerStatus&gt;"| Trk["WorkerTracker & FSM\n(Greedy IoU + Streak De-bouncing)"]
-    Trk -->|"std::vector&lt;TrackedWorker&gt;"| Hud["HUD Renderer & Telemetry\n(Alpha Zones + AlertState Boxes)"]
+    Cam["Frame Producer Thread\n(Video File / Live Camera / Synthetic)"] -->|"std::move(cv::Mat)"| Queue["BoundedQueue&lt;cv::Mat&gt;\n(std::mutex + condition_variable)"]
+    Queue -->|"Pre-Allocated Buffer View"| Det["ONNX Detector\n(Letterbox + YOLOv8 NMS)"]
+    Det -->|"std::vector&lt;Detection&gt;"| Geo["Spatial SafetyAnalyzer\n(Greedy 1:1 IoPA + Point-in-Polygon)"]
+    Geo -->|"std::vector&lt;WorkerStatus&gt;"| Trk["WorkerTracker & FSM\n(ByteTrack-Inspired 2-Stage + Alpha-Beta)"]
+    Trk -->|"std::vector&lt;TrackedWorker&gt;"| Hud["HUD Renderer & VideoWriter\n(Alpha Zones + AlertState Boxes)"]
 ```
 
 ```text
 +--------------------+     push / push_drop_oldest     +---------------------------+
 |  Producer Thread   | ------------------------------> |   BoundedQueue<cv::Mat>   |
-| (Camera / Stream)  |                                 |  (RAII Mutex + CondVars)  |
+| (Camera / Video)   |                                 |  (RAII Mutex + CondVars)  |
 +--------------------+                                 +-------------+-------------+
                                                                      | pop() -> std::optional<cv::Mat>
                                                                      v
 +--------------------+    TrackedWorker    +-------------------------+-------------------------+
-|    HUD Renderer    | <------------------ |                 SafetyPipeline                    |
+| HUD & VideoWriter  | <------------------ |                 SafetyPipeline                    |
 |  Alpha Polygons &  |                     |  1. Detector       : Letterbox -> NCHW -> ORT     |
-|  AlertState Boxes  |                     |  2. SafetyAnalyzer : IoPA Binding + Polygon Test  |
-+--------------------+                     |  3. WorkerTracker  : Greedy IoU + FSM De-bouncing |
+|  AlertState Boxes  |                     |  2. SafetyAnalyzer : Greedy 1:1 IoPA + Homography |
++--------------------+                     |  3. WorkerTracker  : 2-Stage IoU + FSM De-bounce  |
                                            +---------------------------------------------------+
 ```
 
@@ -38,32 +38,32 @@ flowchart LR
 
 ## Key C++17 Systems & Vision Engineering Highlights
 
-### 1. Zero-Allocation Steady-State Preprocessing & Zero-Copy ONNX Tensor Wrapping
-- **`Detector` (`include/safety_engine/detector.hpp`, `src/detector.cpp`)** pre-allocates its contiguous planar `NCHW` buffer (`std::vector<float> input_tensor_values_`) and intermediate `cv::Mat` workspaces (`resized_buffer_`, `letterbox_buffer_`, `float_buffer_`) once during construction.
-- During inference, three lightweight `cv::Mat` headers (`CV_32F`) alias offsets directly inside `input_tensor_values_.data()`, allowing `cv::split` to scatter interleaved `HWC` floats straight into planar `NCHW` memory without heap allocations.
-- `Ort::Value::CreateTensor<float>` wraps `input_tensor_values_.data()` in-place (zero-copy) before invoking `Ort::Session::Run`.
+### 1. Pre-Allocated Contiguous Buffer Preprocessing & Zero-Copy ONNX Tensor Wrapping
+- **`Detector` (`include/safety_engine/detector.hpp`, `src/detector.cpp`)** implements pre-allocated contiguous buffer preprocessing by allocating its planar `NCHW` buffer (`std::vector<float> input_tensor_values_`) and intermediate `cv::Mat` workspaces (`resized_buffer_`, `letterbox_buffer_`, `float_buffer_`) once during construction.
+- During inference, three lightweight `cv::Mat` headers (`CV_32F`) alias offsets directly inside `input_tensor_values_.data()`, allowing `cv::split` to scatter interleaved `HWC` floats straight into planar `NCHW` memory without steady-state heap allocations.
+- `Ort::Value::CreateTensor<float>` wraps `input_tensor_values_.data()` in-place before invoking `Ort::Session::Run`.
+- **Explicit ONNX Model Contract Validation**: Both constructor initialization and `postprocess()` verify that input tensors are float32 with rank 4 (`[1 or dynamic, 3, H, W]`) and output tensors are float32 with rank 3 (`[1, channels, num_anchors]`) where `channels >= 7` (`4 box coords + 3 PPE classes {Person, Helmet, Vest}`).
 - Strict **LIFO member declaration order** guarantees deterministic RAII teardown (`Ort::Session` releases before `Ort::SessionOptions` and `Ort::Env`; `const char*` name views expire before their owning `std::string` buffers), while deleted copy/move operations prevent dangling pointer views.
 
-### 2. Exclusive 1-to-1 Bipartite PPE Binding (IoPA) & Calibrated Ground-Plane Homography
+### 2. Greedy 1-to-1 Containment Assignment (IoPA) & Explicit Ground-Plane Homography
 - **`SafetyAnalyzer` (`include/safety_engine/geometry.hpp`, `src/geometry.cpp`)** avoids naive bounding-box IoU failure modes (where a small helmet box inside a large person box yields artificially low IoU) by computing **Intersection-over-PPE-Area (IoPA)** containment:
   $$\text{IoPA}(B_{\text{person}}, B_{\text{ppe}}) = \frac{|B_{\text{person}} \cap B_{\text{ppe}}|}{|B_{\text{ppe}}|}$$
-- Enforces **exclusive one-to-one (1:1) bipartite assignment** across candidate `(person_index, ppe_index, score)` pairs ranked by IoPA containment and anatomical center affinity, ensuring overlapping `Person` bounding boxes can never double-claim the same `Helmet` or `Vest` detection.
+- Performs **greedy 1-to-1 containment assignment** (rather than globally optimal Hungarian matching) across candidate `(person_idx, ppe_idx, score)` pairs sorted under a strict weak ordering (`score` descending, then `std::tie(person_idx, ppe_idx)` ascending), ensuring overlapping `Person` bounding boxes cannot double-claim the same `Helmet` or `Vest` detection.
 - Enforces vertical anatomical priors relative to person height (helmets restricted to the upper cranial band $[0.0, 0.35]$, vests restricted to the torso band $[0.15, 0.75]$), rejecting dropped helmets on the floor.
-- Supports optional **$3\times3$ Ground-Plane Homography Calibration** (`compute_ground_homography`, `project_point_homography`, `SafetyAnalyzer::set_homography`) via `cv::Matx33f`, projecting image-space `feet_point` into metric ground coordinates (`WorkerStatus::ground_point`) before evaluating `HazardZone` polygons via `cv::pointPolygonTest`.
+- Supports optional **$3\times3$ Ground-Plane Homography Calibration** (`compute_ground_homography`, `project_point_homography`, `SafetyAnalyzer::set_homography`) via `cv::Matx33f`:
+  - `SafetyAnalyzer::set_homography` validates that all entries are finite and `std::abs(cv::determinant(H)) > 1e-9`, throwing `std::invalid_argument` on singular or degenerate matrices.
+  - `project_point_homography` returns `std::optional<cv::Point2f>`, explicitly returning `std::nullopt` when $w \to 0$ (`std::abs(w) <= 1e-6f`) or when projected coordinates are non-finite (`NaN`/`Inf`). When projection fails, `WorkerStatus::ground_projection_valid` is set to `false` and hazard-zone evaluation is skipped for that worker rather than comparing raw pixel coordinates against metric ground polygons.
 
-### 3. ByteTrack Two-Stage Association, Constant-Velocity Prediction & Configurable Dropout Policy
-- **`WorkerTracker` (`include/safety_engine/tracker.hpp`, `src/tracker.cpp`)** tracks bounding-box kinematics `(vx, vy, vw, vh)` using an $\alpha$-$\beta$ exponential smoothing filter and matches incoming detections against `TrackedWorker::predict_next_bbox()`.
-- Implements **ByteTrack two-stage association**:
+### 3. ByteTrack-Inspired Two-Stage Confidence Tracker with Constant-Velocity Alpha-Beta Prediction
+- **`WorkerTracker` (`include/safety_engine/tracker.hpp`, `src/tracker.cpp`)** is a **ByteTrack-inspired two-stage confidence tracker with constant-velocity alpha-beta prediction**:
+  - Tracks bounding-box kinematics `(vx, vy, vw, vh)` using an $\alpha$-$\beta$ exponential smoothing filter and matches incoming detections against `TrackedWorker::predict_next_bbox()` via greedy IoU assignment with strict weak ordering (`std::tie(track_idx, worker_idx)` tie-breaking).
   - **Stage 1**: Matches active tracks against high-confidence detections (`person_confidence >= high_conf_thresh_`, default `0.50`).
-  - **Stage 2**: Matches remaining unmatched active tracks against low-confidence detections (`person_confidence < high_conf_thresh_`, e.g., partially occluded workers) to prevent ID switches and track fragmentation, while initializing new tracks strictly from unmatched high-confidence detections.
+  - **Stage 2**: Matches remaining unmatched active tracks against low-confidence detections (`person_confidence < high_conf_thresh_`, e.g., partially occluded workers) to mitigate ID switches and track fragmentation, while initializing new tracks strictly from unmatched high-confidence detections.
 - Implements a 3-state de-bouncing Finite State Machine (`AlertState::Safe` $\rightarrow$ `SuspectedViolation` $\rightarrow$ `ActiveAlert`) with explicit `DropoutStreakPolicy` (`HoldStreak`, `StrictReset`, `DecayStreak`) and separate `consecutive_observed_violations` and `total_violation_frames` counters.
 
-### 4. Thread-Safe Bounded Producer-Consumer Queue
-- **`BoundedQueue<T>` (`include/safety_engine/frame_queue.hpp`)** coordinates frame ingestion and inference using `std::mutex`, two `std::condition_variable` primitives (`cv_not_empty_`, `cv_not_full_`), move-only payload semantics, and `std::optional<T>` draining.
-- Supports two operational modes:
-  - **Lossless Backpressure (`push`)**: Blocks the producer when full—ideal for offline video auditing and deterministic benchmarking.
-  - **Real-Time Low-Latency (`push_drop_oldest`)**: Evicts the oldest queued frame when at capacity so live camera capture never stalls behind slow inference spikes.
-- `close()` atomically transitions queue state and broadcasts `notify_all()` on both condition variables for deadlock-free multi-threaded shutdown.
+### 4. Thread-Safe Bounded Producer-Consumer Queue & End-to-End Video Stream Pipeline
+- **`BoundedQueue<T>` (`include/safety_engine/frame_queue.hpp`)** coordinates frame ingestion and inference using `std::mutex`, two `std::condition_variable` primitives (`cv_not_empty_`, `cv_not_full_`), move-only payload semantics, and `std::optional<T>` draining (`push` for lossless backpressure, `push_drop_oldest` for real-time low-latency capture).
+- **`SafetyPipeline::run_video_stream` (`include/safety_engine/pipeline.hpp`, `src/pipeline.cpp`)** connects `cv::VideoCapture` decoding on the Producer thread with `process_frame` + `render_hud` + optional `cv::VideoWriter` encoding on the Consumer thread, recording stage-by-stage `std::chrono::steady_clock` P50/P95/P99 latency telemetry.
 
 ---
 
@@ -72,7 +72,7 @@ flowchart LR
 `SafetyPipeline::run_multithreaded_benchmark` executes configurable warm-up iterations (`warmup_frames = 10` by default) through the full Detector + Geometry + Tracker pipeline prior to starting `std::chrono::steady_clock` timers so ONNX Runtime arena allocation and thread-pool initialization do not skew steady-state P50/P95/P99 percentiles.
 
 ### 1. Pipeline & Memory Overhead Benchmark (`models/dummy_yolo.onnx`)
-Isolates C++ zero-copy `Ort::Value` tensor wrapping, aspect-ratio letterboxing, `NCHW` planar scatter, spatial geometry, and producer-consumer queue synchronization (`./build/safety_app --benchmark --model models/dummy_yolo.onnx --frames 50 --warmup 10` on `1920x1080` `CV_8UC3`):
+Isolates C++ pre-allocated contiguous buffer preprocessing, `Ort::Value` tensor wrapping, aspect-ratio letterboxing, `NCHW` planar scatter, spatial geometry, and producer-consumer queue synchronization (`./build/safety_app --benchmark --model models/dummy_yolo.onnx --frames 50 --warmup 10` on `1920x1080` `CV_8UC3`):
 
 ```text
 Benchmark Mode: Pipeline & Memory Overhead Benchmark (dummy_yolo.onnx - isolates C++ zero-copy tensor wrapping, letterboxing, geometry & thread sync)
@@ -102,7 +102,7 @@ Benchmark Configuration: 50 timed frames + 10 warm-up frames @ 1920x1080 (BGR8),
 | Spatial Geometry (IoPA + Polygon) |     0.006 |     0.004 |     0.015 |     0.019 |
 | Tracker + State Machine           |     0.005 |     0.003 |     0.012 |     0.015 |
 +-----------------------------------+-----------+-----------+-----------+-----------+
-| Total End-to-End                  |    19.032 |    17.434 |    39.559 |     48.736 |
+| Total End-to-End                  |    19.032 |    17.434 |    39.559 |    48.736 |
 +-----------------------------------+-----------+-----------+-----------+-----------+
 Overall Producer-Consumer Throughput: 46.04 FPS (50 frames, 0 drops)
 ```
@@ -135,7 +135,7 @@ ctest --test-dir build --output-on-failure
 ```
 
 ### 3. AddressSanitizer & UndefinedBehaviorSanitizer Verification (`ENABLE_ASAN`)
-Verify zero memory leaks, buffer overflows, dangling references, or undefined behavior across all 19 unit and multi-threaded integration tests:
+Verify zero memory leaks, buffer overflows, dangling references, or undefined behavior across all unit and multi-threaded integration tests:
 ```bash
 cmake -S . -B build_asan \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -147,18 +147,24 @@ ctest --test-dir build_asan --output-on-failure
 ./build_asan/safety_app --benchmark --frames 25 --warmup 5
 ```
 
-### 4. Run the CLI Benchmarks & Export HUD Demo Frames
+### 4. Run End-to-End Video / Live Camera Inference & CLI Benchmarks
 ```bash
-# 1. Pipeline & Memory Overhead Benchmark (dummy_yolo.onnx)
+# 1. End-to-end video file inference with HUD overlay output
+./build/safety_app --video input.mp4 --output annotated.mp4 --model models/ppe_yolov8n.onnx
+
+# 2. Live camera inference (webcam index 0) with optional frame cap
+./build/safety_app --video 0 --output live_hud.mp4 --model models/yolov8n_bench.onnx --max-frames 300
+
+# 3. Pipeline & Memory Overhead Benchmark (dummy_yolo.onnx)
 ./build/safety_app --benchmark --model models/dummy_yolo.onnx --frames 50 --warmup 10
 
-# 2. Full Neural Network Compute Benchmark (yolov8n_bench.onnx)
+# 4. Full Neural Network Compute Benchmark (yolov8n_bench.onnx)
 ./build/safety_app --benchmark --model models/yolov8n_bench.onnx --frames 50 --warmup 10
 
-# 3. Export 60-frame 1280x720 industrial floor HUD demo sequence
+# 5. Export 60-frame 1280x720 industrial floor HUD demo sequence
 ./build/safety_app --export-demo demo_frames
 
-# 4. Custom stress test + save rendered HUD overlay image
+# 6. Custom stress test + save rendered HUD overlay image
 ./build/safety_app \
   --benchmark \
   --model models/dummy_yolo.onnx \
@@ -177,31 +183,32 @@ ctest --test-dir build_asan --output-on-failure
 ```text
 .
 ├── CMakeLists.txt                       # C++17 build configuration, Threads, ONNX Runtime & ENABLE_ASAN
+├── LICENSE                              # MIT License
 ├── assets/
 │   └── hud_demo.gif                     # 60-frame 1280x720 HUD telemetry & FSM de-bouncing demo
 ├── include/safety_engine/
 │   ├── types.hpp                        # Core domain structs (Detection, HazardZone, WorkerStatus)
 │   ├── version.hpp                      # Engine semantic version metadata
-│   ├── detector.hpp                     # RAII zero-copy ONNX Runtime YOLOv8 detector
-│   ├── geometry.hpp                     # 1:1 IoPA PPE matching, 3x3 homography & SafetyAnalyzer
-│   ├── tracker.hpp                      # ByteTrack 2-stage tracker, velocity prediction & DropoutStreakPolicy
+│   ├── detector.hpp                     # RAII pre-allocated ONNX Runtime YOLOv8 detector & contract checks
+│   ├── geometry.hpp                     # Greedy 1:1 IoPA PPE matching, 3x3 homography & SafetyAnalyzer
+│   ├── tracker.hpp                      # ByteTrack-inspired 2-stage tracker, alpha-beta & DropoutStreakPolicy
 │   ├── frame_queue.hpp                  # Thread-safe BoundedQueue<T> template
-│   └── pipeline.hpp                     # SafetyPipeline, HUD renderer & warm-up percentile profiler
+│   └── pipeline.hpp                     # SafetyPipeline, video stream runner, HUD renderer & profiler
 ├── src/
 │   ├── version.cpp
 │   ├── detector.cpp
 │   ├── geometry.cpp
 │   ├── tracker.cpp
 │   ├── pipeline.cpp
-│   └── main.cpp                         # Production CLI & dual-mode latency benchmark runner
+│   └── main.cpp                         # CLI for real video/camera inference & latency benchmarks
 ├── scripts/
 │   ├── create_dummy_yolo_onnx.py        # Zero-dependency minimal ONNX graph generator (pipeline overhead)
-│   └── create_realistic_yolov8n_onnx.py # Multi-layer Conv2D + SiLU + SPPF + Detect ONNX benchmark generator
+│   └── create_realistic_yolov8n_onnx.py # 3-class Conv2D + SiLU + SPPF + Detect ONNX generator & validator
 └── tests/
     ├── CMakeLists.txt                   # GoogleTest discovery
     ├── test_smoke.cpp                   # Toolchain & version sanity tests
-    ├── test_detector.cpp                # Letterbox math & end-to-end ONNX Runtime tests
-    ├── test_geometry.cpp                # 1:1 PPE assignment, homography projection & polygon hazard tests
+    ├── test_detector.cpp                # Letterbox math, ONNX contract validation & end-to-end ORT tests
+    ├── test_geometry.cpp                # Greedy 1:1 PPE assignment, degenerate homography & polygon tests
     ├── test_tracker_and_queue.cpp       # Velocity prediction, ByteTrack stage-2, dropout policies & queue tests
-    └── test_pipeline.cpp                # Full pipeline integration, HUD rendering & FPS benchmarks
+    └── test_pipeline.cpp                # End-to-end video file inference, HUD rendering & FPS benchmarks
 ```

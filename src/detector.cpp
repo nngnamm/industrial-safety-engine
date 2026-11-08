@@ -66,6 +66,71 @@ Detector::Detector(const std::string& model_path, float conf_threshold, float io
         output_names_str_.emplace_back(name_ptr.get());
         output_names_.push_back(output_names_str_.back().c_str());
     }
+
+    // Validate ONNX input tensor contract: float32, rank 4 ([1 or dynamic, 3, H, W])
+    const Ort::TypeInfo input_type_info = session_.GetInputTypeInfo(0);
+    if (input_type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
+        throw std::runtime_error("Detector: ONNX model input[0] is not a tensor.");
+    }
+    const auto input_tensor_info = input_type_info.GetTensorTypeAndShapeInfo();
+    if (input_tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+        throw std::runtime_error(
+            "Detector: ONNX model input[0] element type must be float32 "
+            "(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT).");
+    }
+    const std::vector<int64_t> model_input_shape = input_tensor_info.GetShape();
+    if (model_input_shape.size() != 4) {
+        throw std::runtime_error(
+            "Detector: ONNX model input[0] must have rank 4 ([1, 3, H, W]).");
+    }
+    if (model_input_shape[0] > 0 && model_input_shape[0] != 1) {
+        throw std::runtime_error(
+            "Detector: ONNX model input[0] batch dimension must be 1 or dynamic.");
+    }
+    if (model_input_shape[1] > 0 && model_input_shape[1] != 3) {
+        throw std::runtime_error(
+            "Detector: ONNX model input[0] channel dimension must be 3 (RGB).");
+    }
+    if (model_input_shape[2] > 0 &&
+        model_input_shape[2] != static_cast<int64_t>(input_height_)) {
+        throw std::runtime_error(
+            "Detector: ONNX model input[0] height does not match configured input_height_.");
+    }
+    if (model_input_shape[3] > 0 &&
+        model_input_shape[3] != static_cast<int64_t>(input_width_)) {
+        throw std::runtime_error(
+            "Detector: ONNX model input[0] width does not match configured input_width_.");
+    }
+
+    // Validate ONNX output tensor contract: float32, rank 3 ([1, channels >= 7, num_anchors])
+    const Ort::TypeInfo output_type_info = session_.GetOutputTypeInfo(0);
+    if (output_type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
+        throw std::runtime_error("Detector: ONNX model output[0] is not a tensor.");
+    }
+    const auto output_tensor_info = output_type_info.GetTensorTypeAndShapeInfo();
+    if (output_tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+        throw std::runtime_error(
+            "Detector: ONNX model output[0] element type must be float32 "
+            "(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT).");
+    }
+    const std::vector<int64_t> model_output_shape = output_tensor_info.GetShape();
+    if (model_output_shape.size() != 3) {
+        throw std::runtime_error(
+            "Detector: ONNX model output[0] must have rank 3 ([1, channels, num_anchors]).");
+    }
+    if (model_output_shape[0] > 0 && model_output_shape[0] != 1) {
+        throw std::runtime_error(
+            "Detector: ONNX model output[0] batch dimension must be 1 or dynamic.");
+    }
+    if (model_output_shape[1] > 0 && model_output_shape[1] < 4 + kExpectedNumClasses) {
+        throw std::runtime_error(
+            "Detector: ONNX model output[0] channel dimension must be >= 7 "
+            "(4 box coords + 3 PPE classes {Person, Helmet, Vest}).");
+    }
+    if (model_output_shape[2] == 0) {
+        throw std::runtime_error(
+            "Detector: ONNX model output[0] num_anchors dimension must be > 0.");
+    }
 }
 
 LetterboxInfo Detector::compute_letterbox_info(int src_w, int src_h, int dst_w, int dst_h) {
@@ -156,10 +221,15 @@ std::vector<Detection> Detector::postprocess(Ort::Value& output_tensor,
                                              const LetterboxInfo& letterbox_info, int orig_w,
                                              int orig_h) const {
     const Ort::TensorTypeAndShapeInfo shape_info = output_tensor.GetTensorTypeAndShapeInfo();
-    const std::vector<int64_t> shape = shape_info.GetShape();
-    if (shape.size() != 3 || shape[0] != 1 || shape[1] < 5 || shape[2] <= 0) {
+    if (shape_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
         throw std::runtime_error(
-            "Detector::postprocess: unexpected output tensor shape (expected [1, 4+C, N]).");
+            "Detector::postprocess: output tensor element type must be float32 "
+            "(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT).");
+    }
+    const std::vector<int64_t> shape = shape_info.GetShape();
+    if (shape.size() != 3 || shape[0] != 1 || shape[1] < 4 + kExpectedNumClasses || shape[2] <= 0) {
+        throw std::runtime_error(
+            "Detector::postprocess: unexpected output tensor shape (expected [1, >=7, N]).");
     }
 
     const int rows = static_cast<int>(shape[1]);  // 4 + num_classes
