@@ -1,0 +1,51 @@
+name: C++17 CI & AddressSanitizer
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-and-test-asan:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config libopencv-dev wget python3
+
+      - name: Cache ONNX Runtime C++ v1.19.2
+        id: cache-onnxruntime
+        uses: actions/cache@v4
+        with:
+          path: third_party/onnxruntime
+          key: ${{ runner.os }}-onnxruntime-linux-x64-1.19.2
+
+      - name: Download and extract ONNX Runtime C++ v1.19.2
+        if: steps.cache-onnxruntime.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p third_party/onnxruntime
+          wget -q https://github.com/microsoft/onnxruntime/releases/download/v1.19.2/onnxruntime-linux-x64-1.19.2.tgz -O /tmp/onnxruntime-linux-x64-1.19.2.tgz
+          tar -xzf /tmp/onnxruntime-linux-x64-1.19.2.tgz -C third_party/onnxruntime --strip-components=1
+          rm -f /tmp/onnxruntime-linux-x64-1.19.2.tgz
+
+      - name: Generate synthetic test model
+        run: python3 scripts/create_dummy_yolo_onnx.py
+
+      - name: Configure & Build Release + Run Benchmark
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DONNXRUNTIME_ROOT_DIR=$PWD/third_party/onnxruntime
+          cmake --build build -j$(nproc)
+          ./build/safety_app --benchmark
+
+      - name: Configure & Build Debug with AddressSanitizer + UndefinedBehaviorSanitizer & Run CTest
+        run: |
+          cmake -B build_asan -DCMAKE_BUILD_TYPE=Debug -DENABLE_ASAN=ON -DONNXRUNTIME_ROOT_DIR=$PWD/third_party/onnxruntime
+          cmake --build build_asan -j$(nproc)
+          ctest --test-dir build_asan --output-on-failure

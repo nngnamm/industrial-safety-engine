@@ -1,3 +1,5 @@
+[![CI](https://github.com/nngnamm/industrial-safety-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/nngnamm/industrial-safety-engine/actions/workflows/ci.yml)
+
 # Real-Time Industrial Worker Safety & Hazard Zone Analytics Engine
 
 An embedded-ready, zero-overhead **C++17** computer vision and spatial-temporal safety analytics engine built on **ONNX Runtime** and **OpenCV 4**. Designed for industrial edge deployments (manufacturing presses, high-voltage bays, automated logistics corridors), the engine performs multi-class PPE detection, anatomical spatial association, polygonal hazard-zone compliance checking, multi-object IoU tracking, and consecutive-frame violation de-bouncing across a lock-minimal Producer-Consumer pipeline.
