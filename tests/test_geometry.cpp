@@ -152,3 +152,111 @@ TEST(GeometryTest, HazardZoneViolationDetection) {
         EXPECT_TRUE(statuses[0].violated_zones.empty());
     }
 }
+
+TEST(GeometryTest, OneToOnePPEAssignmentPreventsDoubleClaim) {
+    const SafetyAnalyzer analyzer;
+
+    // Two overlapping Person boxes standing close together:
+    // Person 0 (left/background): [100, 100, 120, 300], head center X = 160
+    // Person 1 (right/foreground, closer to helmet): [130, 100, 120, 300], head center X = 190
+    const Detection person_far{cv::Rect2f(100.0f, 100.0f, 120.0f, 300.0f), 0.94f,
+                               static_cast<int>(ClassId::Person)};
+    const Detection person_closer{cv::Rect2f(130.0f, 100.0f, 120.0f, 300.0f), 0.95f,
+                                  static_cast<int>(ClassId::Person)};
+
+    // Single Helmet at [172, 115, 36, 36] (center X = 190, inside BOTH person boxes [100..220]
+    // and [130..250] with 100% containment, but centered directly on person_closer's head).
+    const Detection shared_helmet{cv::Rect2f(172.0f, 115.0f, 36.0f, 36.0f), 0.92f,
+                                  static_cast<int>(ClassId::Helmet)};
+
+    // Single Vest at [165, 175, 50, 95] (center X = 190, also centered on person_closer).
+    const Detection shared_vest{cv::Rect2f(165.0f, 175.0f, 50.0f, 95.0f), 0.91f,
+                                static_cast<int>(ClassId::Vest)};
+
+    // Place person_far FIRST in the input list to prove 1-to-1 assignment is not a naive
+    // first-come-first-served loop and never allows both persons to claim the same PPE.
+    const std::vector<WorkerStatus> statuses =
+        analyzer.analyze_frame({person_far, person_closer, shared_helmet, shared_vest}, {});
+    ASSERT_EQ(statuses.size(), 2U);
+
+    // Only the closer person (index 1) gets the helmet and vest; person 0 gets neither.
+    EXPECT_FALSE(statuses[0].has_helmet);
+    EXPECT_FALSE(statuses[0].helmet_bbox.has_value());
+    EXPECT_FALSE(statuses[0].has_vest);
+    EXPECT_FALSE(statuses[0].vest_bbox.has_value());
+
+    EXPECT_TRUE(statuses[1].has_helmet);
+    ASSERT_TRUE(statuses[1].helmet_bbox.has_value());
+    EXPECT_EQ(*statuses[1].helmet_bbox, shared_helmet.bbox);
+    EXPECT_TRUE(statuses[1].has_vest);
+    ASSERT_TRUE(statuses[1].vest_bbox.has_value());
+    EXPECT_EQ(*statuses[1].vest_bbox, shared_vest.bbox);
+}
+
+TEST(GeometryTest, HomographyGroundPlaneProjection) {
+    // Perspective trapezoidal floor quad in image space mapping to a 10m x 10m metric square
+    const std::array<cv::Point2f, 4> image_quad = {{
+        {400.0f, 200.0f},  // top-left (far)
+        {600.0f, 200.0f},  // top-right (far)
+        {800.0f, 600.0f},  // bottom-right (near)
+        {200.0f, 600.0f},  // bottom-left (near)
+    }};
+    const std::array<cv::Point2f, 4> ground_square = {{
+        {0.0f, 0.0f},
+        {10.0f, 0.0f},
+        {10.0f, 10.0f},
+        {0.0f, 10.0f},
+    }};
+
+    const cv::Matx33f H = safety_engine::compute_ground_homography(image_quad, ground_square);
+
+    // Verify all 4 corners project accurately to the metric square in ground coordinates
+    for (std::size_t i = 0; i < 4U; ++i) {
+        const cv::Point2f projected = safety_engine::project_point_homography(image_quad[i], H);
+        EXPECT_NEAR(projected.x, ground_square[i].x, 1e-3f);
+        EXPECT_NEAR(projected.y, ground_square[i].y, 1e-3f);
+    }
+
+    // Define a calibrated ground-plane HazardZone covering the metric square [0, 10] x [0, 10]
+    const HazardZone metric_zone{
+        "CalibratedPressZone",
+        {{0.0f, 0.0f}, {10.0f, 0.0f}, {10.0f, 10.0f}, {0.0f, 10.0f}},
+        /*require_helmet=*/true,
+        /*require_vest=*/false,
+    };
+
+    SafetyAnalyzer analyzer;
+    analyzer.set_homography(H);
+    EXPECT_TRUE(analyzer.has_homography());
+
+    // Worker whose feet_point is at (500, 400) in image pixels -> maps into the metric square
+    const Detection worker_inside{cv::Rect2f(460.0f, 200.0f, 80.0f, 200.0f), 0.95f,
+                                  static_cast<int>(ClassId::Person)};
+    // Worker whose feet_point is at (100, 400) in image pixels -> maps outside the metric square
+    const Detection worker_outside{cv::Rect2f(60.0f, 200.0f, 80.0f, 200.0f), 0.95f,
+                                   static_cast<int>(ClassId::Person)};
+
+    const std::vector<WorkerStatus> calibrated_statuses =
+        analyzer.analyze_frame({worker_inside, worker_outside}, {metric_zone});
+    ASSERT_EQ(calibrated_statuses.size(), 2U);
+
+    EXPECT_FLOAT_EQ(calibrated_statuses[0].feet_point.x, 500.0f);
+    EXPECT_FLOAT_EQ(calibrated_statuses[0].feet_point.y, 400.0f);
+    EXPECT_NEAR(calibrated_statuses[0].ground_point.x, 5.0f, 1e-3f);
+    EXPECT_GT(calibrated_statuses[0].ground_point.y, 0.0f);
+    EXPECT_LT(calibrated_statuses[0].ground_point.y, 10.0f);
+    EXPECT_TRUE(calibrated_statuses[0].in_hazard_zone);
+    EXPECT_TRUE(calibrated_statuses[0].is_violating);
+
+    EXPECT_LT(calibrated_statuses[1].ground_point.x, 0.0f);
+    EXPECT_FALSE(calibrated_statuses[1].in_hazard_zone);
+    EXPECT_FALSE(calibrated_statuses[1].is_violating);
+
+    // Clearing homography restores uncalibrated pixel-space behavior (ground_point == feet_point)
+    analyzer.clear_homography();
+    EXPECT_FALSE(analyzer.has_homography());
+    const std::vector<WorkerStatus> uncalibrated_statuses =
+        analyzer.analyze_frame({worker_inside}, {metric_zone});
+    ASSERT_EQ(uncalibrated_statuses.size(), 1U);
+    EXPECT_EQ(uncalibrated_statuses[0].ground_point, uncalibrated_statuses[0].feet_point);
+}

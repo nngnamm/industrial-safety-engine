@@ -21,6 +21,7 @@ struct StageLatencyStats {
 
 struct BenchmarkReport {
     std::size_t total_frames{0};
+    std::size_t warmup_frames{0};
     StageLatencyStats detect_stats;
     StageLatencyStats geometry_stats;
     StageLatencyStats tracker_stats;
@@ -46,7 +47,8 @@ class SafetyPipeline {
             "ONNX: 1.83 ms | Geometry: 0.002 ms | Tracker: 0.002 ms | 96.7 FPS");
 
     BenchmarkReport run_multithreaded_benchmark(int num_frames = 100, int width = 1920,
-                                                int height = 1080, std::size_t queue_capacity = 8);
+                                                int height = 1080, std::size_t queue_capacity = 8,
+                                                int warmup_frames = 10);
 
     const std::vector<HazardZone>& hazard_zones() const noexcept { return hazard_zones_; }
 

@@ -48,6 +48,7 @@ struct CliOptions {
     std::string save_hud_path;
     std::string export_demo_dir;
     int num_frames{50};
+    int warmup_frames{10};
     int width{1920};
     int height{1080};
     std::size_t queue_capacity{8};
@@ -76,8 +77,11 @@ void print_usage(const char* prog_name) {
               << "  --benchmark               Run multi-threaded synthetic latency benchmark "
                  "(default)\n"
               << "  --model <path>            Path to ONNX model (default: "
-                 "models/dummy_yolo.onnx)\n"
-              << "  --frames <N>              Number of benchmark frames (default: 50)\n"
+                 "models/dummy_yolo.onnx;\n"
+              << "                            use models/yolov8n_bench.onnx for Conv2D NN "
+                 "benchmark)\n"
+              << "  --frames <N>              Number of timed benchmark frames (default: 50)\n"
+              << "  --warmup <N>              Number of warm-up frames before timing (default: 10)\n"
               << "  --width <W>               Synthetic frame width (default: 1920)\n"
               << "  --height <H>              Synthetic frame height (default: 1080)\n"
               << "  --queue-capacity <cap>    BoundedQueue capacity (default: 8)\n"
@@ -91,6 +95,15 @@ int parse_positive_int(const std::string& flag, const std::string& raw) {
     const int value = std::stoi(raw, &idx);
     if (idx != raw.size() || value <= 0) {
         throw std::invalid_argument("Invalid positive integer for " + flag + ": " + raw);
+    }
+    return value;
+}
+
+int parse_non_negative_int(const std::string& flag, const std::string& raw) {
+    std::size_t idx = 0;
+    const int value = std::stoi(raw, &idx);
+    if (idx != raw.size() || value < 0) {
+        throw std::invalid_argument("Invalid non-negative integer for " + flag + ": " + raw);
     }
     return value;
 }
@@ -119,6 +132,11 @@ CliOptions parse_args(int argc, char* argv[], bool& help_requested) {
                 throw std::invalid_argument("Missing argument for --frames");
             }
             opts.num_frames = parse_positive_int("--frames", argv[++i]);
+        } else if (arg == "--warmup") {
+            if (i + 1 >= argc) {
+                throw std::invalid_argument("Missing argument for --warmup");
+            }
+            opts.warmup_frames = parse_non_negative_int("--warmup", argv[++i]);
         } else if (arg == "--width") {
             if (i + 1 >= argc) {
                 throw std::invalid_argument("Missing argument for --width");
@@ -168,9 +186,21 @@ void print_benchmark_table(const safety_engine::BenchmarkReport& report, const C
     const std::string sep =
         "+-----------------------------------+-----------+-----------+-----------+-----------+\n";
 
+    const bool is_dummy_model =
+        opts.model_path.find("dummy_yolo") != std::string::npos;
+    const std::string benchmark_mode =
+        is_dummy_model
+            ? "Pipeline & Memory Overhead Benchmark (dummy_yolo.onnx - isolates C++ zero-copy "
+              "tensor wrapping, letterboxing, geometry & thread sync)"
+            : "Full Neural Network Compute Benchmark (" +
+                  std::filesystem::path(opts.model_path).filename().string() +
+                  " - multi-layer Conv2D + SiLU + Detect CPU inference)";
+
     std::cout << '\n'
-              << "Benchmark Configuration: " << report.total_frames << " frames @ " << opts.width
-              << "x" << opts.height << " (BGR8), Queue Capacity = " << opts.queue_capacity << '\n'
+              << "Benchmark Mode: " << benchmark_mode << '\n'
+              << "Benchmark Configuration: " << report.total_frames << " timed frames + "
+              << report.warmup_frames << " warm-up frames @ " << opts.width << "x" << opts.height
+              << " (BGR8), Queue Capacity = " << opts.queue_capacity << '\n'
               << sep
               << "| Pipeline Stage                    | Mean (ms) |  P50 (ms) |  P95 (ms) |  P99 "
                  "(ms) |\n"
@@ -477,7 +507,7 @@ int main(int argc, char* argv[]) {
 
         if (opts.run_benchmark) {
             const safety_engine::BenchmarkReport report = pipeline.run_multithreaded_benchmark(
-                opts.num_frames, opts.width, opts.height, opts.queue_capacity);
+                opts.num_frames, opts.width, opts.height, opts.queue_capacity, opts.warmup_frames);
             print_benchmark_table(report, opts);
         }
 

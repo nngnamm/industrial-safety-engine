@@ -1,6 +1,9 @@
 #include "safety_engine/geometry.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <stdexcept>
 
@@ -9,44 +12,106 @@ namespace safety_engine {
 namespace {
 
 constexpr float kAreaEpsilon = 1e-6f;
-constexpr float kScoreTieEpsilon = 1e-5f;
+constexpr float kScoreTieEpsilon = 1e-6f;
 
-const Detection* find_best_ppe_match(const cv::Rect2f& person_box,
-                                     const std::vector<const Detection*>& candidates, float min_y,
-                                     float max_y, float containment_thresh) noexcept {
-    const Detection* best_match = nullptr;
-    float best_containment = -1.0f;
-    float best_confidence = -1.0f;
+struct PPEAssignmentCandidate {
+    std::size_t person_index;
+    std::size_t ppe_index;
+    float score;
+    float ppe_confidence;
+};
 
-    for (const Detection* cand : candidates) {
-        const cv::Rect2f& ppe_box = cand->bbox;
-        if (ppe_box.width <= 0.0f || ppe_box.height <= 0.0f) {
+void assign_ppe_one_to_one(const std::vector<const Detection*>& persons,
+                           const std::vector<const Detection*>& ppe_items, float min_rel_y,
+                           float max_rel_y, float containment_thresh, bool is_helmet,
+                           std::vector<WorkerStatus>& results) {
+    if (persons.empty() || ppe_items.empty()) {
+        return;
+    }
+
+    std::vector<PPEAssignmentCandidate> candidates;
+    candidates.reserve(persons.size() * ppe_items.size());
+
+    const float band_rel_h = std::max(max_rel_y - min_rel_y, kAreaEpsilon);
+    const float target_rel_y = 0.5f * (min_rel_y + max_rel_y);
+
+    for (std::size_t p_idx = 0; p_idx < persons.size(); ++p_idx) {
+        const cv::Rect2f& person_box = persons[p_idx]->bbox;
+        if (person_box.width <= 0.0f || person_box.height <= 0.0f) {
             continue;
         }
 
-        const float cy = ppe_box.y + 0.5f * ppe_box.height;
-        if (cy < min_y || cy > max_y) {
-            continue;
-        }
+        const float min_y = person_box.y + min_rel_y * person_box.height;
+        const float max_y = person_box.y + max_rel_y * person_box.height;
+        const float person_cx = person_box.x + 0.5f * person_box.width;
+        const float target_cy = person_box.y + target_rel_y * person_box.height;
+        const float half_w = std::max(0.5f * person_box.width, kAreaEpsilon);
+        const float half_band_h = std::max(0.5f * band_rel_h * person_box.height, kAreaEpsilon);
 
-        const float containment = compute_containment_ratio(person_box, ppe_box);
-        if (containment < containment_thresh) {
-            continue;
-        }
+        for (std::size_t item_idx = 0; item_idx < ppe_items.size(); ++item_idx) {
+            const Detection* cand = ppe_items[item_idx];
+            const cv::Rect2f& ppe_box = cand->bbox;
+            if (ppe_box.width <= 0.0f || ppe_box.height <= 0.0f) {
+                continue;
+            }
 
-        const bool strictly_better = containment > (best_containment + kScoreTieEpsilon);
-        const bool tied_with_higher_conf =
-            (std::abs(containment - best_containment) <= kScoreTieEpsilon) &&
-            (cand->confidence > best_confidence);
+            const float cy = ppe_box.y + 0.5f * ppe_box.height;
+            if (cy < min_y || cy > max_y) {
+                continue;
+            }
 
-        if (strictly_better || tied_with_higher_conf) {
-            best_match = cand;
-            best_containment = containment;
-            best_confidence = cand->confidence;
+            const float containment = compute_containment_ratio(person_box, ppe_box);
+            if (containment < containment_thresh) {
+                continue;
+            }
+
+            const float cx = ppe_box.x + 0.5f * ppe_box.width;
+            const float norm_dx = (cx - person_cx) / half_w;
+            const float norm_dy = (cy - target_cy) / half_band_h;
+            const float center_affinity =
+                1.0f / (1.0f + norm_dx * norm_dx + 0.25f * norm_dy * norm_dy);
+
+            // Primary rank by IoPA containment; break ties by anatomical center proximity & score.
+            const float score = containment + 0.05f * center_affinity;
+            candidates.push_back(
+                PPEAssignmentCandidate{p_idx, item_idx, score, cand->confidence});
         }
     }
 
-    return best_match;
+    std::sort(candidates.begin(), candidates.end(),
+              [](const PPEAssignmentCandidate& lhs, const PPEAssignmentCandidate& rhs) {
+                  if (std::abs(lhs.score - rhs.score) > kScoreTieEpsilon) {
+                      return lhs.score > rhs.score;
+                  }
+                  if (std::abs(lhs.ppe_confidence - rhs.ppe_confidence) > kScoreTieEpsilon) {
+                      return lhs.ppe_confidence > rhs.ppe_confidence;
+                  }
+                  if (lhs.person_index != rhs.person_index) {
+                      return lhs.person_index < rhs.person_index;
+                  }
+                  return lhs.ppe_index < rhs.ppe_index;
+              });
+
+    std::vector<bool> person_claimed(persons.size(), false);
+    std::vector<bool> ppe_claimed(ppe_items.size(), false);
+
+    for (const PPEAssignmentCandidate& cand : candidates) {
+        if (person_claimed[cand.person_index] || ppe_claimed[cand.ppe_index]) {
+            continue;
+        }
+        person_claimed[cand.person_index] = true;
+        ppe_claimed[cand.ppe_index] = true;
+
+        WorkerStatus& status = results[cand.person_index];
+        const cv::Rect2f& matched_box = ppe_items[cand.ppe_index]->bbox;
+        if (is_helmet) {
+            status.helmet_bbox = matched_box;
+            status.has_helmet = true;
+        } else {
+            status.vest_bbox = matched_box;
+            status.has_vest = true;
+        }
+    }
 }
 
 }  // namespace
@@ -95,6 +160,39 @@ bool is_point_in_polygon(const cv::Point2f& pt, const std::vector<cv::Point2f>& 
     return cv::pointPolygonTest(polygon, pt, false) >= 0.0;
 }
 
+cv::Matx33f compute_ground_homography(const std::array<cv::Point2f, 4>& image_points,
+                                      const std::array<cv::Point2f, 4>& ground_points) {
+    const cv::Mat h64 = cv::getPerspectiveTransform(image_points.data(), ground_points.data());
+    if (h64.rows != 3 || h64.cols != 3) {
+        throw std::invalid_argument(
+            "compute_ground_homography: failed to solve 3x3 perspective transform.");
+    }
+
+    cv::Matx33f H;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            const double val = h64.at<double>(r, c);
+            if (!std::isfinite(val)) {
+                throw std::invalid_argument(
+                    "compute_ground_homography: degenerate point configuration produced non-finite "
+                    "homography.");
+            }
+            H(r, c) = static_cast<float>(val);
+        }
+    }
+    return H;
+}
+
+cv::Point2f project_point_homography(const cv::Point2f& pt, const cv::Matx33f& H) noexcept {
+    const float x = H(0, 0) * pt.x + H(0, 1) * pt.y + H(0, 2);
+    const float y = H(1, 0) * pt.x + H(1, 1) * pt.y + H(1, 2);
+    const float w = H(2, 0) * pt.x + H(2, 1) * pt.y + H(2, 2);
+    if (std::abs(w) <= kAreaEpsilon) {
+        return pt;
+    }
+    return cv::Point2f(x / w, y / w);
+}
+
 SafetyAnalyzer::SafetyAnalyzer(float ppe_containment_thresh, float helmet_max_rel_y,
                                float vest_min_rel_y, float vest_max_rel_y)
     : ppe_containment_thresh_(ppe_containment_thresh),
@@ -112,6 +210,14 @@ SafetyAnalyzer::SafetyAnalyzer(float ppe_containment_thresh, float helmet_max_re
         throw std::invalid_argument(
             "SafetyAnalyzer: vest relative Y bounds must satisfy 0.0 <= min < max <= 1.0.");
     }
+}
+
+void SafetyAnalyzer::set_homography(const cv::Matx33f& H) noexcept {
+    homography_ = H;
+}
+
+void SafetyAnalyzer::clear_homography() noexcept {
+    homography_.reset();
 }
 
 std::vector<WorkerStatus> SafetyAnalyzer::analyze_frame(
@@ -148,30 +254,22 @@ std::vector<WorkerStatus> SafetyAnalyzer::analyze_frame(
         status.person_bbox = person_det->bbox;
         status.person_confidence = person_det->confidence;
         status.feet_point = compute_feet_point(status.person_bbox);
+        status.ground_point = homography_.has_value()
+                                  ? project_point_homography(status.feet_point, *homography_)
+                                  : status.feet_point;
+        results.push_back(std::move(status));
+    }
 
-        if (status.person_bbox.width > 0.0f && status.person_bbox.height > 0.0f) {
-            const float py = status.person_bbox.y;
-            const float ph = status.person_bbox.height;
+    // Exclusive 1-to-1 bipartite assignment for helmets and vests
+    assign_ppe_one_to_one(persons, helmets, 0.0f, helmet_max_rel_y_, ppe_containment_thresh_,
+                          /*is_helmet=*/true, results);
+    assign_ppe_one_to_one(persons, vests, vest_min_rel_y_, vest_max_rel_y_, ppe_containment_thresh_,
+                          /*is_helmet=*/false, results);
 
-            const Detection* matched_helmet = find_best_ppe_match(
-                status.person_bbox, helmets, py, py + helmet_max_rel_y_ * ph,
-                ppe_containment_thresh_);
-            if (matched_helmet != nullptr) {
-                status.helmet_bbox = matched_helmet->bbox;
-                status.has_helmet = true;
-            }
-
-            const Detection* matched_vest = find_best_ppe_match(
-                status.person_bbox, vests, py + vest_min_rel_y_ * ph, py + vest_max_rel_y_ * ph,
-                ppe_containment_thresh_);
-            if (matched_vest != nullptr) {
-                status.vest_bbox = matched_vest->bbox;
-                status.has_vest = true;
-            }
-        }
-
+    // Evaluate hazard zone compliance in ground-plane coordinates (defaults to feet_point)
+    for (WorkerStatus& status : results) {
         for (const HazardZone& zone : hazard_zones) {
-            if (is_point_in_polygon(status.feet_point, zone.polygon)) {
+            if (is_point_in_polygon(status.ground_point, zone.polygon)) {
                 status.in_hazard_zone = true;
                 const bool missing_helmet = zone.require_helmet && !status.has_helmet;
                 const bool missing_vest = zone.require_vest && !status.has_vest;
@@ -181,8 +279,6 @@ std::vector<WorkerStatus> SafetyAnalyzer::analyze_frame(
                 }
             }
         }
-
-        results.push_back(std::move(status));
     }
 
     return results;

@@ -16,16 +16,18 @@ namespace {
 
 using safety_engine::AlertState;
 using safety_engine::BoundedQueue;
+using safety_engine::DropoutStreakPolicy;
 using safety_engine::TrackedWorker;
 using safety_engine::WorkerStatus;
 using safety_engine::WorkerTracker;
 
 WorkerStatus make_worker(const cv::Rect2f& bbox, bool is_violating, bool has_helmet = false,
-                         bool has_vest = true) {
+                         bool has_vest = true, float confidence = 0.92f) {
     WorkerStatus w;
     w.person_bbox = bbox;
-    w.person_confidence = 0.92f;
+    w.person_confidence = confidence;
     w.feet_point = cv::Point2f(bbox.x + 0.5f * bbox.width, bbox.y + bbox.height);
+    w.ground_point = w.feet_point;
     w.has_helmet = has_helmet;
     w.has_vest = has_vest;
     w.in_hazard_zone = true;
@@ -169,6 +171,125 @@ TEST(TrackerTest, MultiWorkerGreedyOneToOneMatching) {
     EXPECT_EQ(f2[2].age_frames, 1);
     EXPECT_EQ(f2[2].violation_streak, 1);
     EXPECT_EQ(f2[2].alert_state, AlertState::SuspectedViolation);
+}
+
+TEST(TrackerTest, VelocityPredictionAndByteTrackLowConfRecovery) {
+    WorkerTracker tracker(/*iou_threshold=*/0.30f, /*alert_streak_threshold=*/3,
+                          /*max_missed_frames=*/3, DropoutStreakPolicy::HoldStreak,
+                          /*high_conf_thresh=*/0.50f);
+
+    // Frame 1: High-confidence worker spawns Track #1 at x = 100, width = 80
+    const WorkerStatus f1_worker = make_worker(cv::Rect2f(100.0f, 100.0f, 80.0f, 200.0f),
+                                               /*is_violating=*/true, false, true, 0.92f);
+    const std::vector<TrackedWorker> f1 = tracker.update({f1_worker});
+    ASSERT_EQ(f1.size(), 1U);
+    const int original_id = f1[0].track_id;
+
+    // Frame 2: Worker moves rapidly right by dx = +40 to x = 140 (IoU with [100,180] is 40/120 = 0.333 >= 0.30)
+    // Velocity estimate becomes vx = +40 px/frame, so predict_next_bbox() for Frame 3 is x = 180.
+    const WorkerStatus f2_worker = make_worker(cv::Rect2f(140.0f, 100.0f, 80.0f, 200.0f),
+                                               /*is_violating=*/true, false, true, 0.88f);
+    const std::vector<TrackedWorker> f2 = tracker.update({f2_worker});
+    ASSERT_EQ(f2.size(), 1U);
+    EXPECT_EQ(f2[0].track_id, original_id);
+    EXPECT_FLOAT_EQ(f2[0].vx, 40.0f);
+    EXPECT_FLOAT_EQ(f2[0].predict_next_bbox().x, 180.0f);
+
+    // Frame 3: Worker moves by another +55 px to x = 195 AND is partially occluded so confidence
+    // drops to 0.25f (< high_conf_thresh = 0.50f).
+    // Note: Without velocity prediction, IoU([140,220], [195,275]) = 25/135 = 0.185 < 0.30 (would fail!).
+    // With velocity prediction, IoU(pred=[180,260], [195,275]) = 65/95 = 0.684 >= 0.30, and Stage 2
+    // ByteTrack low-confidence association recovers the track without switching track_id!
+    // Also include a spurious low-confidence background box at x = 500 to verify it does NOT spawn a new track.
+    const WorkerStatus f3_occluded_worker = make_worker(cv::Rect2f(195.0f, 100.0f, 80.0f, 200.0f),
+                                                        /*is_violating=*/true, false, true, 0.25f);
+    const WorkerStatus f3_spurious_low_conf = make_worker(
+        cv::Rect2f(500.0f, 100.0f, 80.0f, 200.0f), /*is_violating=*/true, false, true, 0.25f);
+
+    const std::vector<TrackedWorker> f3 =
+        tracker.update({f3_occluded_worker, f3_spurious_low_conf});
+    ASSERT_EQ(f3.size(), 1U);
+    EXPECT_EQ(f3[0].track_id, original_id);
+    EXPECT_EQ(f3[0].age_frames, 3);
+    EXPECT_EQ(f3[0].missed_frames, 0);
+    EXPECT_EQ(f3[0].violation_streak, 3);
+    EXPECT_EQ(f3[0].alert_state, AlertState::ActiveAlert);
+}
+
+TEST(TrackerTest, DropoutStreakPolicies) {
+    const WorkerStatus violating =
+        make_worker(cv::Rect2f(100.0f, 100.0f, 80.0f, 200.0f), /*is_violating=*/true);
+
+    // 1. HoldStreak: preserves violation_streak across missed frames, while resetting consecutive_observed_violations
+    {
+        WorkerTracker hold_tracker(0.30f, /*alert_streak_threshold=*/3, /*max_missed_frames=*/3,
+                                   DropoutStreakPolicy::HoldStreak);
+        hold_tracker.update({violating});
+        const std::vector<TrackedWorker> f2 = hold_tracker.update({violating});
+        ASSERT_EQ(f2.size(), 1U);
+        EXPECT_EQ(f2[0].violation_streak, 2);
+        EXPECT_EQ(f2[0].consecutive_observed_violations, 2);
+        EXPECT_EQ(f2[0].total_violation_frames, 2);
+
+        const std::vector<TrackedWorker> f3_miss = hold_tracker.update({});
+        ASSERT_EQ(f3_miss.size(), 1U);
+        EXPECT_EQ(f3_miss[0].missed_frames, 1);
+        EXPECT_EQ(f3_miss[0].violation_streak, 2);
+        EXPECT_EQ(f3_miss[0].consecutive_observed_violations, 0);
+        EXPECT_EQ(f3_miss[0].total_violation_frames, 2);
+        EXPECT_EQ(f3_miss[0].alert_state, AlertState::SuspectedViolation);
+
+        const std::vector<TrackedWorker> f4_reappear = hold_tracker.update({violating});
+        ASSERT_EQ(f4_reappear.size(), 1U);
+        EXPECT_EQ(f4_reappear[0].violation_streak, 3);
+        EXPECT_EQ(f4_reappear[0].consecutive_observed_violations, 1);
+        EXPECT_EQ(f4_reappear[0].total_violation_frames, 3);
+        EXPECT_EQ(f4_reappear[0].alert_state, AlertState::ActiveAlert);
+    }
+
+    // 2. StrictReset: any missed frame immediately resets violation_streak = 0 and AlertState::Safe
+    {
+        WorkerTracker strict_tracker(0.30f, /*alert_streak_threshold=*/3, /*max_missed_frames=*/3,
+                                     DropoutStreakPolicy::StrictReset);
+        strict_tracker.update({violating});
+        strict_tracker.update({violating});
+        const std::vector<TrackedWorker> f3 = strict_tracker.update({violating});
+        ASSERT_EQ(f3.size(), 1U);
+        EXPECT_EQ(f3[0].violation_streak, 3);
+        EXPECT_EQ(f3[0].alert_state, AlertState::ActiveAlert);
+
+        const std::vector<TrackedWorker> f4_miss = strict_tracker.update({});
+        ASSERT_EQ(f4_miss.size(), 1U);
+        EXPECT_EQ(f4_miss[0].missed_frames, 1);
+        EXPECT_EQ(f4_miss[0].violation_streak, 0);
+        EXPECT_EQ(f4_miss[0].consecutive_observed_violations, 0);
+        EXPECT_EQ(f4_miss[0].total_violation_frames, 3);
+        EXPECT_EQ(f4_miss[0].alert_state, AlertState::Safe);
+    }
+
+    // 3. DecayStreak: each missed frame decrements violation_streak by 1 and updates AlertState
+    {
+        WorkerTracker decay_tracker(0.30f, /*alert_streak_threshold=*/3, /*max_missed_frames=*/3,
+                                    DropoutStreakPolicy::DecayStreak);
+        decay_tracker.update({violating});
+        decay_tracker.update({violating});
+        const std::vector<TrackedWorker> f3 = decay_tracker.update({violating});
+        ASSERT_EQ(f3.size(), 1U);
+        EXPECT_EQ(f3[0].violation_streak, 3);
+        EXPECT_EQ(f3[0].alert_state, AlertState::ActiveAlert);
+
+        const std::vector<TrackedWorker> f4_miss = decay_tracker.update({});
+        ASSERT_EQ(f4_miss.size(), 1U);
+        EXPECT_EQ(f4_miss[0].violation_streak, 2);
+        EXPECT_EQ(f4_miss[0].consecutive_observed_violations, 0);
+        EXPECT_EQ(f4_miss[0].total_violation_frames, 3);
+        EXPECT_EQ(f4_miss[0].alert_state, AlertState::SuspectedViolation);
+
+        const std::vector<TrackedWorker> f5_miss = decay_tracker.update({});
+        ASSERT_EQ(f5_miss.size(), 1U);
+        EXPECT_EQ(f5_miss[0].violation_streak, 1);
+        EXPECT_EQ(f5_miss[0].alert_state, AlertState::SuspectedViolation);
+    }
 }
 
 TEST(BoundedQueueTest, MultiThreadedProducerConsumer) {

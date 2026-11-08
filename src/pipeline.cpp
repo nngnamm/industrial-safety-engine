@@ -267,7 +267,8 @@ void SafetyPipeline::render_hud(cv::Mat& frame, const std::vector<HazardZone>& z
 }
 
 BenchmarkReport SafetyPipeline::run_multithreaded_benchmark(int num_frames, int width, int height,
-                                                            std::size_t queue_capacity) {
+                                                            std::size_t queue_capacity,
+                                                            int warmup_frames) {
     if (num_frames <= 0) {
         throw std::invalid_argument(
             "SafetyPipeline::run_multithreaded_benchmark: num_frames must be > 0.");
@@ -280,8 +281,26 @@ BenchmarkReport SafetyPipeline::run_multithreaded_benchmark(int num_frames, int 
         throw std::invalid_argument(
             "SafetyPipeline::run_multithreaded_benchmark: queue_capacity must be > 0.");
     }
+    if (warmup_frames < 0) {
+        throw std::invalid_argument(
+            "SafetyPipeline::run_multithreaded_benchmark: warmup_frames must be >= 0.");
+    }
 
     tracker_.reset();
+
+    // Execute warm-up frames through the full pipeline (Detector + Geometry + Tracker)
+    // prior to starting latency timers so JIT/arena initialization does not skew P50/P95/P99.
+    if (warmup_frames > 0) {
+        cv::Mat warmup_frame(height, width, CV_8UC3, cv::Scalar(64.0, 96.0, 128.0));
+        for (int w = 0; w < warmup_frames; ++w) {
+            const std::vector<Detection> detections = detector_.detect(warmup_frame);
+            const std::vector<WorkerStatus> statuses =
+                analyzer_.analyze_frame(detections, hazard_zones_);
+            const std::vector<TrackedWorker> tracked = tracker_.update(statuses);
+            (void)tracked;
+        }
+        tracker_.reset();
+    }
 
     BoundedQueue<cv::Mat> frame_queue(queue_capacity);
 
@@ -342,6 +361,7 @@ BenchmarkReport SafetyPipeline::run_multithreaded_benchmark(int num_frames, int 
 
     BenchmarkReport report;
     report.total_frames = total_ms.size();
+    report.warmup_frames = static_cast<std::size_t>(warmup_frames);
     report.detect_stats = compute_latency_stats(std::move(detect_ms));
     report.geometry_stats = compute_latency_stats(std::move(geometry_ms));
     report.tracker_stats = compute_latency_stats(std::move(tracker_ms));

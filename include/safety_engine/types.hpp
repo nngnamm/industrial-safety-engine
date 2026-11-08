@@ -36,6 +36,7 @@ struct WorkerStatus {
     cv::Rect2f person_bbox;
     float person_confidence{0.0f};
     cv::Point2f feet_point;
+    cv::Point2f ground_point;
     std::optional<cv::Rect2f> helmet_bbox;
     std::optional<cv::Rect2f> vest_bbox;
     bool has_helmet{false};
