@@ -1,6 +1,7 @@
 #include <onnxruntime_cxx_api.h>
 
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>

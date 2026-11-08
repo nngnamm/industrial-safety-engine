@@ -74,6 +74,10 @@ message(STATUS "Found OpenCV ${OpenCV_VERSION}: ${OpenCV_INCLUDE_DIRS}")
 message(STATUS "Found ONNX Runtime include: ${ONNXRUNTIME_INCLUDE_DIR}")
 message(STATUS "Found ONNX Runtime library: ${ONNXRUNTIME_LIB}")
 
+get_filename_component(ONNXRUNTIME_LIB_DIR "${ONNXRUNTIME_LIB}" DIRECTORY)
+set(CMAKE_BUILD_RPATH "${ONNXRUNTIME_ROOT_DIR}/lib")
+list(APPEND CMAKE_BUILD_RPATH "${ONNXRUNTIME_LIB_DIR}")
+
 # ------------------------------------------------------------------------------
 # Core Library Target
 # ------------------------------------------------------------------------------
