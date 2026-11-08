@@ -38,25 +38,51 @@ double interpolate_percentile(const std::vector<double>& sorted_samples, double 
 cv::Scalar alert_state_color(AlertState state) noexcept {
     switch (state) {
         case AlertState::Safe:
-            return cv::Scalar(0, 200, 0);  // Green (BGR)
+            return cv::Scalar(40, 210, 40);  // Green (BGR)
         case AlertState::SuspectedViolation:
-            return cv::Scalar(0, 180, 255);  // Amber / Orange (BGR)
+            return cv::Scalar(0, 190, 255);  // Amber / Orange-Yellow (BGR)
         case AlertState::ActiveAlert:
-            return cv::Scalar(0, 0, 255);  // Red (BGR)
+            return cv::Scalar(25, 25, 240);  // Red (BGR)
     }
     return cv::Scalar(200, 200, 200);
 }
 
-const char* alert_state_label(AlertState state) noexcept {
-    switch (state) {
+std::string format_worker_label(const TrackedWorker& worker) {
+    const std::string prefix = "Worker #" + std::to_string(worker.track_id) + ": ";
+    switch (worker.alert_state) {
         case AlertState::Safe:
-            return "SAFE";
+            return prefix + "SAFE";
         case AlertState::SuspectedViolation:
-            return "SUSPECTED";
-        case AlertState::ActiveAlert:
-            return "ALERT";
+            return prefix + "SUSPECTED (Streak: " + std::to_string(worker.violation_streak) +
+                   "/3)";
+        case AlertState::ActiveAlert: {
+            std::string missing_tag = "[ZONE VIOLATION]";
+            if (!worker.status.has_helmet && !worker.status.has_vest) {
+                missing_tag = "[NO PPE]";
+            } else if (!worker.status.has_helmet) {
+                missing_tag = "[NO HELMET]";
+            } else if (!worker.status.has_vest) {
+                missing_tag = "[NO VEST]";
+            }
+            return prefix + "ACTIVE ALERT " + missing_tag;
+        }
     }
-    return "UNKNOWN";
+    return prefix + "UNKNOWN";
+}
+
+bool zone_has_state(const HazardZone& zone, const std::vector<TrackedWorker>& tracked_workers,
+                    AlertState target_state) {
+    for (const TrackedWorker& worker : tracked_workers) {
+        if (worker.missed_frames > 0 || worker.alert_state != target_state) {
+            continue;
+        }
+        for (const std::string& vz : worker.status.violated_zones) {
+            if (vz == zone.name) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 }  // namespace
@@ -91,7 +117,8 @@ std::vector<TrackedWorker> SafetyPipeline::process_frame(const cv::Mat& frame) {
 }
 
 void SafetyPipeline::render_hud(cv::Mat& frame, const std::vector<HazardZone>& zones,
-                                const std::vector<TrackedWorker>& tracked_workers) {
+                                const std::vector<TrackedWorker>& tracked_workers,
+                                const std::string& telemetry_text) {
     if (frame.empty()) {
         return;
     }
@@ -119,20 +146,49 @@ void SafetyPipeline::render_hud(cv::Mat& frame, const std::vector<HazardZone>& z
         valid_zones.push_back(&zone);
     }
 
-    if (!zone_polygons.empty()) {
-        cv::Mat overlay = frame.clone();
-        cv::fillPoly(overlay, zone_polygons, cv::Scalar(0, 50, 210));
-        cv::addWeighted(overlay, 0.25, frame, 0.75, 0.0, frame);
+    for (std::size_t i = 0; i < zone_polygons.size(); ++i) {
+        const bool is_active_alert =
+            zone_has_state(*valid_zones[i], tracked_workers, AlertState::ActiveAlert);
+        const bool is_suspected =
+            !is_active_alert &&
+            zone_has_state(*valid_zones[i], tracked_workers, AlertState::SuspectedViolation);
 
-        for (std::size_t i = 0; i < zone_polygons.size(); ++i) {
-            cv::polylines(frame, zone_polygons[i], /*isClosed=*/true, cv::Scalar(0, 140, 255), 2,
-                          cv::LINE_AA);
-            if (!valid_zones[i]->name.empty()) {
-                const cv::Point anchor = zone_polygons[i].front();
-                cv::putText(frame, "ZONE: " + valid_zones[i]->name,
-                            cv::Point(anchor.x + 6, std::max(20, anchor.y + 22)),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 200, 255), 2, cv::LINE_AA);
-            }
+        cv::Scalar fill_color(0, 95, 175);
+        cv::Scalar border_color(0, 185, 245);
+        double alpha = 0.16;
+        int border_thickness = 2;
+        std::string status_suffix;
+
+        if (is_active_alert) {
+            fill_color = cv::Scalar(0, 0, 230);
+            border_color = cv::Scalar(20, 20, 255);
+            alpha = 0.32;
+            border_thickness = 3;
+            status_suffix = " [ACTIVE ALERT]";
+        } else if (is_suspected) {
+            fill_color = cv::Scalar(0, 140, 255);
+            border_color = cv::Scalar(0, 200, 255);
+            alpha = 0.22;
+            border_thickness = 2;
+            status_suffix = " [SUSPECTED]";
+        }
+
+        cv::Mat overlay = frame.clone();
+        const std::vector<std::vector<cv::Point>> single_poly = {zone_polygons[i]};
+        cv::fillPoly(overlay, single_poly, fill_color);
+        cv::addWeighted(overlay, alpha, frame, 1.0 - alpha, 0.0, frame);
+
+        cv::polylines(frame, zone_polygons[i], /*isClosed=*/true, border_color, border_thickness,
+                      cv::LINE_AA);
+        if (!valid_zones[i]->name.empty()) {
+            const cv::Point anchor = zone_polygons[i].front();
+            const std::string zone_title = "ZONE: " + valid_zones[i]->name + status_suffix;
+            const cv::Scalar title_color =
+                is_active_alert ? cv::Scalar(70, 70, 255) : cv::Scalar(0, 215, 255);
+            cv::putText(frame, zone_title, cv::Point(anchor.x + 8, std::max(24, anchor.y + 26)),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.62, cv::Scalar(12, 12, 12), 4, cv::LINE_AA);
+            cv::putText(frame, zone_title, cv::Point(anchor.x + 8, std::max(24, anchor.y + 26)),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.62, title_color, 2, cv::LINE_AA);
         }
     }
 
@@ -148,26 +204,65 @@ void SafetyPipeline::render_hud(cv::Mat& frame, const std::vector<HazardZone>& z
                            static_cast<int>(std::lround(worker.status.person_bbox.width)),
                            static_cast<int>(std::lround(worker.status.person_bbox.height)));
 
-        cv::rectangle(frame, box, color, 2, cv::LINE_AA);
+        if (worker.status.helmet_bbox.has_value()) {
+            const cv::Rect hbox(static_cast<int>(std::lround(worker.status.helmet_bbox->x)),
+                                static_cast<int>(std::lround(worker.status.helmet_bbox->y)),
+                                static_cast<int>(std::lround(worker.status.helmet_bbox->width)),
+                                static_cast<int>(std::lround(worker.status.helmet_bbox->height)));
+            cv::rectangle(frame, hbox, cv::Scalar(190, 245, 60), 1, cv::LINE_AA);
+        }
+        if (worker.status.vest_bbox.has_value()) {
+            const cv::Rect vbox(static_cast<int>(std::lround(worker.status.vest_bbox->x)),
+                                static_cast<int>(std::lround(worker.status.vest_bbox->y)),
+                                static_cast<int>(std::lround(worker.status.vest_bbox->width)),
+                                static_cast<int>(std::lround(worker.status.vest_bbox->height)));
+            cv::rectangle(frame, vbox, cv::Scalar(50, 225, 225), 1, cv::LINE_AA);
+        }
+
+        const int box_thickness = (worker.alert_state == AlertState::ActiveAlert) ? 3 : 2;
+        cv::rectangle(frame, box, color, box_thickness, cv::LINE_AA);
 
         const cv::Point feet_pt(static_cast<int>(std::lround(worker.status.feet_point.x)),
                                 static_cast<int>(std::lround(worker.status.feet_point.y)));
-        cv::circle(frame, feet_pt, 4, color, cv::FILLED, cv::LINE_AA);
+        cv::circle(frame, feet_pt, 5, color, cv::FILLED, cv::LINE_AA);
+        cv::circle(frame, feet_pt, 9, color, 1, cv::LINE_AA);
 
-        const std::string tag = "ID:" + std::to_string(worker.track_id) + " " +
-                                alert_state_label(worker.alert_state) +
-                                " [streak:" + std::to_string(worker.violation_streak) + "]";
+        const std::string tag = format_worker_label(worker);
 
         int baseline = 0;
         const cv::Size text_size =
-            cv::getTextSize(tag, cv::FONT_HERSHEY_SIMPLEX, 0.55, 2, &baseline);
-        const int label_top = std::max(box.y - text_size.height - 8, 0);
-        const cv::Rect label_bg(box.x, label_top, text_size.width + 10,
-                                text_size.height + baseline + 6);
+            cv::getTextSize(tag, cv::FONT_HERSHEY_SIMPLEX, 0.54, 2, &baseline);
+        const int label_top = std::max(box.y - text_size.height - 10, 0);
+        const int label_x = std::clamp(box.x, 4, std::max(4, frame.cols - text_size.width - 16));
+        const cv::Rect label_bg(label_x, label_top, text_size.width + 12,
+                                text_size.height + baseline + 8);
 
         cv::rectangle(frame, label_bg, color, cv::FILLED);
-        cv::putText(frame, tag, cv::Point(box.x + 5, label_top + text_size.height + 2),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(15, 15, 15), 2, cv::LINE_AA);
+        const cv::Scalar text_fg = (worker.alert_state == AlertState::ActiveAlert)
+                                       ? cv::Scalar(250, 250, 250)
+                                       : cv::Scalar(15, 15, 15);
+        cv::putText(frame, tag, cv::Point(label_x + 6, label_top + text_size.height + 3),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.54, text_fg, 2, cv::LINE_AA);
+    }
+
+    // 3. Render top-left live stage telemetry bar
+    if (!telemetry_text.empty()) {
+        int baseline = 0;
+        const cv::Size telem_size =
+            cv::getTextSize(telemetry_text, cv::FONT_HERSHEY_SIMPLEX, 0.56, 2, &baseline);
+        const cv::Rect telem_rect(14, 12, std::min(frame.cols - 28, telem_size.width + 24),
+                                  telem_size.height + baseline + 16);
+        if (telem_rect.width > 0 && telem_rect.height > 0 &&
+            telem_rect.x + telem_rect.width <= frame.cols &&
+            telem_rect.y + telem_rect.height <= frame.rows) {
+            cv::Mat roi = frame(telem_rect);
+            cv::Mat dark_bg(roi.size(), roi.type(), cv::Scalar(18, 22, 28));
+            cv::addWeighted(dark_bg, 0.82, roi, 0.18, 0.0, roi);
+            cv::rectangle(frame, telem_rect, cv::Scalar(90, 180, 220), 1, cv::LINE_AA);
+            cv::putText(frame, telemetry_text,
+                        cv::Point(telem_rect.x + 12, telem_rect.y + telem_size.height + 7),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.56, cv::Scalar(230, 245, 255), 2, cv::LINE_AA);
+        }
     }
 }
 

@@ -1,5 +1,7 @@
 [![CI](https://github.com/nngnamm/industrial-safety-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/nngnamm/industrial-safety-engine/actions/workflows/ci.yml)
 
+![Industrial Safety Engine HUD Demo](assets/hud_demo.gif)
+
 # Real-Time Industrial Worker Safety & Hazard Zone Analytics Engine
 
 An embedded-ready, zero-overhead **C++17** computer vision and spatial-temporal safety analytics engine built on **ONNX Runtime** and **OpenCV 4**. Designed for industrial edge deployments (manufacturing presses, high-voltage bays, automated logistics corridors), the engine performs multi-class PPE detection, anatomical spatial association, polygonal hazard-zone compliance checking, multi-object IoU tracking, and consecutive-frame violation de-bouncing across a lock-minimal Producer-Consumer pipeline.
@@ -118,10 +120,13 @@ ctest --test-dir build_asan --output-on-failure
 ./build_asan/safety_app --benchmark --frames 25
 ```
 
-### 4. Run the CLI Benchmark & Export a Sample HUD Frame
+### 4. Run the CLI Benchmark & Export HUD Demo Frames
 ```bash
 # Default 50-frame 1920x1080 multi-threaded benchmark
 ./build/safety_app
+
+# Export 60-frame 1280x720 industrial floor HUD demo sequence
+./build/safety_app --export-demo demo_frames
 
 # Custom stress test + save rendered HUD overlay image
 ./build/safety_app \
@@ -141,6 +146,8 @@ ctest --test-dir build_asan --output-on-failure
 ```text
 .
 ├── CMakeLists.txt                       # C++17 build configuration, Threads, ONNX Runtime & ENABLE_ASAN
+├── assets/
+│   └── hud_demo.gif                     # 60-frame 1280x720 HUD telemetry & FSM de-bouncing demo
 ├── include/safety_engine/
 │   ├── types.hpp                        # Core domain structs (Detection, HazardZone, WorkerStatus)
 │   ├── version.hpp                      # Engine semantic version metadata
