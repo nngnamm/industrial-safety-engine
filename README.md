@@ -69,7 +69,7 @@ flowchart LR
 
 ---
 
-## Model Training & Held-Out Validation Metrics (Construction-PPE)
+## Model Training & Held-Out Validation Metrics (Ultralytics Construction-PPE, 3-Class Contract)
 
 ### Dataset Provenance & Class Remapping
 - **Source Dataset**: [Ultralytics Construction-PPE](https://docs.ultralytics.com/datasets/detect/construction-ppe/) (`1,132` training images, `143` held-out validation images).
@@ -88,65 +88,44 @@ flowchart LR
 | **`2: Vest`** | `0.9522` | `0.9324` | `0.9541` | `0.7623` |
 | **Overall (All Classes)** | **`0.9181`** | **`0.7710`** | **`0.8340`** | **`0.6174`** |
 
-### Real Trained YOLOv8n (`models/ppe_yolov8n.onnx`) CPU Latency Profile
-Measured end-to-end through the C++17 producer-consumer pipeline (`./build/safety_app --benchmark --model models/ppe_yolov8n.onnx --frames 50 --warmup 10` on `1920x1080` `CV_8UC3`, `CPUExecutionProvider`):
-
-```text
-Benchmark Mode: Full Neural Network Compute Benchmark (ppe_yolov8n.onnx - multi-layer Conv2D + SiLU + Detect CPU inference)
-Benchmark Configuration: 50 timed frames + 10 warm-up frames @ 1920x1080 (BGR8), Queue Capacity = 8
-+-----------------------------------+-----------+-----------+-----------+-----------+
-| Pipeline Stage                    | Mean (ms) |  P50 (ms) |  P95 (ms) |  P99 (ms) |
-+-----------------------------------+-----------+-----------+-----------+-----------+
-| Detector (ONNX)                   |    40.379 |    38.023 |    42.466 |    86.068 |
-| Spatial Geometry (IoPA + Polygon) |     0.001 |     0.000 |     0.001 |     0.002 |
-| Tracker + State Machine           |     0.001 |     0.001 |     0.001 |     0.003 |
-+-----------------------------------+-----------+-----------+-----------+-----------+
-| Total End-to-End                  |    40.380 |    38.024 |    42.467 |    86.070 |
-+-----------------------------------+-----------+-----------+-----------+-----------+
-Overall Producer-Consumer Throughput: 24.58 FPS (50 frames, 0 drops)
-```
-
 ---
 
-## Benchmark & Stage Latency Profiles
+## Performance Benchmarks
 
 `SafetyPipeline::run_multithreaded_benchmark` executes configurable warm-up iterations (`warmup_frames = 10` by default) through the full Detector + Geometry + Tracker pipeline prior to starting `std::chrono::steady_clock` timers so ONNX Runtime arena allocation and thread-pool initialization do not skew steady-state P50/P95/P99 percentiles.
 
-### 1. Pipeline & Memory Overhead Benchmark (`models/dummy_yolo.onnx`)
+### Table 1 — C++ Pipeline & Pre-allocated Memory Overhead (`dummy_yolo.onnx`, 1920x1080, 10 warm-up frames)
 Isolates C++ pre-allocated contiguous buffer preprocessing, `Ort::Value` tensor wrapping, aspect-ratio letterboxing, `NCHW` planar scatter, spatial geometry, and producer-consumer queue synchronization (`./build/safety_app --benchmark --model models/dummy_yolo.onnx --frames 50 --warmup 10` on `1920x1080` `CV_8UC3`):
 
-```text
-Benchmark Mode: Pipeline & Memory Overhead Benchmark (dummy_yolo.onnx - isolates C++ zero-copy tensor wrapping, letterboxing, geometry & thread sync)
-Benchmark Configuration: 50 timed frames + 10 warm-up frames @ 1920x1080 (BGR8), Queue Capacity = 8
-+-----------------------------------+-----------+-----------+-----------+-----------+
-| Pipeline Stage                    | Mean (ms) |  P50 (ms) |  P95 (ms) |  P99 (ms) |
-+-----------------------------------+-----------+-----------+-----------+-----------+
-| Detector (ONNX)                   |     1.864 |     1.774 |     2.495 |     2.551 |
-| Spatial Geometry (IoPA + Polygon) |     0.002 |     0.002 |     0.004 |     0.004 |
-| Tracker + State Machine           |     0.003 |     0.002 |     0.004 |     0.007 |
-+-----------------------------------+-----------+-----------+-----------+-----------+
-| Total End-to-End                  |     1.869 |     1.779 |     2.502 |     2.562 |
-+-----------------------------------+-----------+-----------+-----------+-----------+
-Overall Producer-Consumer Throughput: 96.04 FPS (50 frames, 0 drops)
-```
+| Pipeline Stage | Mean | P50 | P95 | P99 |
+| :--- | ---: | ---: | ---: | ---: |
+| **Detector** | `1.800 ms` | `1.768 ms` | `2.253 ms` | `2.346 ms` |
+| **Spatial Geometry** | `0.002 ms` | `0.002 ms` | `0.003 ms` | `0.003 ms` |
+| **Tracker + State Machine** | `0.002 ms` | `0.002 ms` | `0.003 ms` | `0.004 ms` |
+| **Total End-to-End** | **`1.805 ms`** | **`1.772 ms`** | **`2.259 ms`** | **`2.352 ms`** |
 
-### 2. Full Neural Network Compute Benchmark (`models/yolov8n_bench.onnx`)
-Reports realistic CPU `Conv2D + SiLU + SPPF + Multi-Scale Detect` inference latency across P3/P4/P5 feature pyramids (`./build/safety_app --benchmark --model models/yolov8n_bench.onnx --frames 50 --warmup 10` on `1920x1080` `CV_8UC3`):
+- **Overall Producer-Consumer Throughput**: **98.41 FPS** (`50` frames, `0` drops)
 
-```text
-Benchmark Mode: Full Neural Network Compute Benchmark (yolov8n_bench.onnx - multi-layer Conv2D + SiLU + Detect CPU inference)
-Benchmark Configuration: 50 timed frames + 10 warm-up frames @ 1920x1080 (BGR8), Queue Capacity = 8
-+-----------------------------------+-----------+-----------+-----------+-----------+
-| Pipeline Stage                    | Mean (ms) |  P50 (ms) |  P95 (ms) |  P99 (ms) |
-+-----------------------------------+-----------+-----------+-----------+-----------+
-| Detector (ONNX)                   |    19.021 |    17.420 |    39.542 |    48.730 |
-| Spatial Geometry (IoPA + Polygon) |     0.006 |     0.004 |     0.015 |     0.019 |
-| Tracker + State Machine           |     0.005 |     0.003 |     0.012 |     0.015 |
-+-----------------------------------+-----------+-----------+-----------+-----------+
-| Total End-to-End                  |    19.032 |    17.434 |    39.559 |    48.736 |
-+-----------------------------------+-----------+-----------+-----------+-----------+
-Overall Producer-Consumer Throughput: 46.04 FPS (50 frames, 0 drops)
-```
+### Table 2 — Trained YOLOv8n PPE Model CPU Inference (`ppe_yolov8n.onnx`, 1920x1080, 10 warm-up frames, `CPUExecutionProvider`)
+Measured end-to-end through the C++17 producer-consumer pipeline (`./build/safety_app --benchmark --model models/ppe_yolov8n.onnx --frames 50 --warmup 10` on `1920x1080` `CV_8UC3`, `CPUExecutionProvider`):
+
+| Pipeline Stage | Mean | P50 | P95 | P99 |
+| :--- | ---: | ---: | ---: | ---: |
+| **Detector (ONNX)** | `41.561 ms` | `40.360 ms` | `53.284 ms` | `54.047 ms` |
+| **Spatial Geometry** | `0.001 ms` | `0.001 ms` | `0.001 ms` | `0.001 ms` |
+| **Tracker + State Machine** | `0.001 ms` | `0.001 ms` | `0.002 ms` | `0.002 ms` |
+| **Total End-to-End** | **`41.562 ms`** | **`40.362 ms`** | **`53.287 ms`** | **`54.049 ms`** |
+
+- **Overall Producer-Consumer Throughput**: **23.92 FPS** (`50` frames, `0` drops)
+
+### Table 3 — End-to-End Video File Decode + Inference + MP4 Encode (`ppe_test_stream.mp4`, 1280x720, 90 frames, 0 warm-up frames)
+Measured during full video stream decoding (`cv::VideoCapture`), real trained `ppe_yolov8n.onnx` inference, HUD overlay rendering, and `cv::VideoWriter` MP4 encoding (`./build/safety_app --video assets/ppe_test_stream.mp4 --output assets/ppe_real_inference.mp4 --model models/ppe_yolov8n.onnx`):
+
+| Pipeline Stage | Mean | P50 | P95 | P99 |
+| :--- | ---: | ---: | ---: | ---: |
+| **Total End-to-End** | **`49.553 ms`** | **`38.009 ms`** | **`103.270 ms`** | **`186.010 ms`** |
+
+- **Overall Video Stream Throughput**: **17.58 FPS** (demonstrating why warm-up iterations reduce P99 tail latency from `186.01 ms` to `54.05 ms` once ONNX Runtime thread-pool and arena allocations stabilize).
 
 ---
 
