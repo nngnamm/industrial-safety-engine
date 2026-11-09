@@ -1,6 +1,8 @@
 [![CI](https://github.com/nngnamm/industrial-safety-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/nngnamm/industrial-safety-engine/actions/workflows/ci.yml)
 
-![Industrial Safety Engine HUD Demo](assets/hud_demo.gif)
+| Real Trained YOLOv8n Video Inference (`models/ppe_yolov8n.onnx`) | Synthetic 3-Frame FSM De-Bouncing & Hazard Polygon Telemetry |
+| :---: | :---: |
+| ![Real Trained YOLOv8n PPE Video Inference](assets/ppe_real_demo.gif) | ![Industrial Safety Engine HUD Demo](assets/hud_demo.gif) |
 
 # Real-Time Industrial Worker Safety & Hazard Zone Analytics Engine
 
@@ -64,6 +66,45 @@ flowchart LR
 ### 4. Thread-Safe Bounded Producer-Consumer Queue & End-to-End Video Stream Pipeline
 - **`BoundedQueue<T>` (`include/safety_engine/frame_queue.hpp`)** coordinates frame ingestion and inference using `std::mutex`, two `std::condition_variable` primitives (`cv_not_empty_`, `cv_not_full_`), move-only payload semantics, and `std::optional<T>` draining (`push` for lossless backpressure, `push_drop_oldest` for real-time low-latency capture).
 - **`SafetyPipeline::run_video_stream` (`include/safety_engine/pipeline.hpp`, `src/pipeline.cpp`)** connects `cv::VideoCapture` decoding on the Producer thread with `process_frame` + `render_hud` + optional `cv::VideoWriter` encoding on the Consumer thread, recording stage-by-stage `std::chrono::steady_clock` P50/P95/P99 latency telemetry.
+
+---
+
+## Model Training & Held-Out Validation Metrics (Construction-PPE)
+
+### Dataset Provenance & Class Remapping
+- **Source Dataset**: [Ultralytics Construction-PPE](https://docs.ultralytics.com/datasets/detect/construction-ppe/) (`1,132` training images, `143` held-out validation images).
+- **Target Schema (`models/ppe_yolov8n.onnx`)**: Remapped and filtered to the 3 core industrial safety classes expected by `safety_engine::Detector`:
+  - `0: Person` (`person`)
+  - `1: Helmet` (`helmet`)
+  - `2: Vest` (`vest`)
+- **ONNX Export Contract**: Opset 17, static float32 input `images: [1, 3, 640, 640]` $\rightarrow$ float32 output `output0: [1, 7, 8400]` (`4` box coordinates `[cx, cy, w, h]` + `3` class confidence scores).
+
+### Held-Out Validation Accuracy (`assets/ppe_metrics.json`)
+
+| Class (`class_id`) | Precision ($P$) | Recall ($R$) | mAP@50 | mAP@50-95 |
+| :--- | ---: | ---: | ---: | ---: |
+| **`0: Person`** | `0.8660` | `0.5779` | `0.6768` | `0.4233` |
+| **`1: Helmet`** | `0.9362` | `0.8027` | `0.8711` | `0.6667` |
+| **`2: Vest`** | `0.9522` | `0.9324` | `0.9541` | `0.7623` |
+| **Overall (All Classes)** | **`0.9181`** | **`0.7710`** | **`0.8340`** | **`0.6174`** |
+
+### Real Trained YOLOv8n (`models/ppe_yolov8n.onnx`) CPU Latency Profile
+Measured end-to-end through the C++17 producer-consumer pipeline (`./build/safety_app --benchmark --model models/ppe_yolov8n.onnx --frames 50 --warmup 10` on `1920x1080` `CV_8UC3`, `CPUExecutionProvider`):
+
+```text
+Benchmark Mode: Full Neural Network Compute Benchmark (ppe_yolov8n.onnx - multi-layer Conv2D + SiLU + Detect CPU inference)
+Benchmark Configuration: 50 timed frames + 10 warm-up frames @ 1920x1080 (BGR8), Queue Capacity = 8
++-----------------------------------+-----------+-----------+-----------+-----------+
+| Pipeline Stage                    | Mean (ms) |  P50 (ms) |  P95 (ms) |  P99 (ms) |
++-----------------------------------+-----------+-----------+-----------+-----------+
+| Detector (ONNX)                   |    40.379 |    38.023 |    42.466 |    86.068 |
+| Spatial Geometry (IoPA + Polygon) |     0.001 |     0.000 |     0.001 |     0.002 |
+| Tracker + State Machine           |     0.001 |     0.001 |     0.001 |     0.003 |
++-----------------------------------+-----------+-----------+-----------+-----------+
+| Total End-to-End                  |    40.380 |    38.024 |    42.467 |    86.070 |
++-----------------------------------+-----------+-----------+-----------+-----------+
+Overall Producer-Consumer Throughput: 24.58 FPS (50 frames, 0 drops)
+```
 
 ---
 
@@ -149,22 +190,25 @@ ctest --test-dir build_asan --output-on-failure
 
 ### 4. Run End-to-End Video / Live Camera Inference & CLI Benchmarks
 ```bash
-# 1. End-to-end video file inference with HUD overlay output
-./build/safety_app --video input.mp4 --output annotated.mp4 --model models/ppe_yolov8n.onnx
+# 1. End-to-end video file inference with trained PPE YOLOv8n model and HUD overlay output
+./build/safety_app --video assets/ppe_test_stream.mp4 --output assets/ppe_real_inference.mp4 --model models/ppe_yolov8n.onnx
 
 # 2. Live camera inference (webcam index 0) with optional frame cap
-./build/safety_app --video 0 --output live_hud.mp4 --model models/yolov8n_bench.onnx --max-frames 300
+./build/safety_app --video 0 --output live_hud.mp4 --model models/ppe_yolov8n.onnx --max-frames 300
 
-# 3. Pipeline & Memory Overhead Benchmark (dummy_yolo.onnx)
+# 3. Real Trained YOLOv8n PPE Model Benchmark (ppe_yolov8n.onnx)
+./build/safety_app --benchmark --model models/ppe_yolov8n.onnx --frames 50 --warmup 10
+
+# 4. Pipeline & Memory Overhead Benchmark (dummy_yolo.onnx)
 ./build/safety_app --benchmark --model models/dummy_yolo.onnx --frames 50 --warmup 10
 
-# 4. Full Neural Network Compute Benchmark (yolov8n_bench.onnx)
+# 5. Synthetic Conv2D Neural Network Compute Benchmark (yolov8n_bench.onnx)
 ./build/safety_app --benchmark --model models/yolov8n_bench.onnx --frames 50 --warmup 10
 
-# 5. Export 60-frame 1280x720 industrial floor HUD demo sequence
+# 6. Export 60-frame 1280x720 industrial floor HUD demo sequence
 ./build/safety_app --export-demo demo_frames
 
-# 6. Custom stress test + save rendered HUD overlay image
+# 7. Custom stress test + save rendered HUD overlay image
 ./build/safety_app \
   --benchmark \
   --model models/dummy_yolo.onnx \
@@ -185,7 +229,13 @@ ctest --test-dir build_asan --output-on-failure
 ├── CMakeLists.txt                       # C++17 build configuration, Threads, ONNX Runtime & ENABLE_ASAN
 ├── LICENSE                              # MIT License
 ├── assets/
-│   └── hud_demo.gif                     # 60-frame 1280x720 HUD telemetry & FSM de-bouncing demo
+│   ├── hud_demo.gif                     # 60-frame 1280x720 synthetic HUD telemetry & FSM de-bouncing demo
+│   ├── ppe_metrics.json                 # Held-out Construction-PPE validation Precision/Recall/mAP metrics
+│   ├── ppe_real_demo.gif                # Real trained YOLOv8n PPE video inference & HUD demo (< 3 MB)
+│   ├── ppe_real_inference.mp4           # Annotated output video from safety_app + ppe_yolov8n.onnx
+│   └── ppe_test_stream.mp4              # Multi-scene held-out test video stream (1280x720)
+├── models/
+│   └── ppe_yolov8n.onnx                 # Real trained 3-class YOLOv8n PPE detector ([1,3,640,640] -> [1,7,8400])
 ├── include/safety_engine/
 │   ├── types.hpp                        # Core domain structs (Detection, HazardZone, WorkerStatus)
 │   ├── version.hpp                      # Engine semantic version metadata

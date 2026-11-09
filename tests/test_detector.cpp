@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
+#include <onnxruntime_cxx_api.h>
 
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <opencv2/core.hpp>
+#include <opencv2/videoio.hpp>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -13,19 +15,26 @@
 
 namespace {
 
-std::filesystem::path resolve_dummy_model_path() {
-    const std::filesystem::path cwd_candidate("models/dummy_yolo.onnx");
-    if (std::filesystem::exists(cwd_candidate)) {
-        return cwd_candidate;
+std::filesystem::path resolve_project_path(const std::filesystem::path& relative_path) {
+    if (std::filesystem::exists(relative_path)) {
+        return relative_path;
     }
 #ifdef SAFETY_ENGINE_PROJECT_ROOT
     const std::filesystem::path root_candidate =
-        std::filesystem::path(SAFETY_ENGINE_PROJECT_ROOT) / "models" / "dummy_yolo.onnx";
+        std::filesystem::path(SAFETY_ENGINE_PROJECT_ROOT) / relative_path;
     if (std::filesystem::exists(root_candidate)) {
         return root_candidate;
     }
 #endif
-    return cwd_candidate;
+    return relative_path;
+}
+
+std::filesystem::path resolve_dummy_model_path() {
+    return resolve_project_path("models/dummy_yolo.onnx");
+}
+
+std::filesystem::path resolve_real_ppe_model_path() {
+    return resolve_project_path("models/ppe_yolov8n.onnx");
 }
 
 void append_varint(std::string& out, uint64_t val) {
@@ -188,5 +197,70 @@ TEST(DetectorTest, RejectsInvalidModelContract) {
     if (std::filesystem::exists(valid_model_path)) {
         EXPECT_THROW(safety_engine::Detector(valid_model_path.string(), 0.45f, 0.50f, 320, 320),
                      std::runtime_error);
+    }
+}
+
+TEST(DetectorTest, RealTrainedPPEModelContractAndInference) {
+    const std::filesystem::path model_path = resolve_real_ppe_model_path();
+    if (!std::filesystem::exists(model_path)) {
+        GTEST_SKIP() << "Skipping real trained PPE model test: " << model_path << " not found.";
+    }
+
+    // 1. Verify exact [1, 3, 640, 640] -> [1, 7, 8400] float32 ONNX tensor contract
+    {
+        Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "RealTrainedPPEContractTest");
+        Ort::SessionOptions opts;
+        Ort::Session session(env, model_path.c_str(), opts);
+
+        ASSERT_EQ(session.GetInputCount(), 1U);
+        ASSERT_EQ(session.GetOutputCount(), 1U);
+
+        const Ort::TypeInfo input_type_info = session.GetInputTypeInfo(0);
+        ASSERT_EQ(input_type_info.GetONNXType(), ONNX_TYPE_TENSOR);
+        const auto input_info = input_type_info.GetTensorTypeAndShapeInfo();
+        EXPECT_EQ(input_info.GetElementType(), ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+        const std::vector<int64_t> expected_in_shape = {1, 3, 640, 640};
+        EXPECT_EQ(input_info.GetShape(), expected_in_shape);
+
+        const Ort::TypeInfo output_type_info = session.GetOutputTypeInfo(0);
+        ASSERT_EQ(output_type_info.GetONNXType(), ONNX_TYPE_TENSOR);
+        const auto output_info = output_type_info.GetTensorTypeAndShapeInfo();
+        EXPECT_EQ(output_info.GetElementType(), ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+        const std::vector<int64_t> expected_out_shape = {1, 7, 8400};
+        EXPECT_EQ(output_info.GetShape(), expected_out_shape);
+    }
+
+    // 2. Verify end-to-end Detector construction and inference execution
+    safety_engine::Detector detector(model_path.string(), 0.25f, 0.45f, 640, 640);
+
+    const cv::Mat synthetic_frame(720, 1280, CV_8UC3, cv::Scalar(114, 114, 114));
+    const std::vector<safety_engine::Detection> synth_dets = detector.detect(synthetic_frame);
+    for (const auto& det : synth_dets) {
+        EXPECT_GE(det.class_id, 0);
+        EXPECT_LT(det.class_id, static_cast<int>(safety_engine::Detector::kExpectedNumClasses));
+        EXPECT_GE(det.confidence, 0.25f);
+        EXPECT_LE(det.confidence, 1.0f);
+    }
+
+    const std::filesystem::path video_path = resolve_project_path("assets/ppe_test_stream.mp4");
+    if (std::filesystem::exists(video_path)) {
+        cv::VideoCapture cap(video_path.string());
+        cv::Mat real_frame;
+        if (cap.isOpened() && cap.read(real_frame) && !real_frame.empty()) {
+            const std::vector<safety_engine::Detection> real_dets = detector.detect(real_frame);
+            EXPECT_FALSE(real_dets.empty());
+            for (const auto& det : real_dets) {
+                EXPECT_GE(det.class_id, 0);
+                EXPECT_LT(det.class_id,
+                          static_cast<int>(safety_engine::Detector::kExpectedNumClasses));
+                EXPECT_GE(det.confidence, 0.25f);
+                EXPECT_LE(det.confidence, 1.0f);
+                EXPECT_GE(det.bbox.x, 0.0f);
+                EXPECT_GE(det.bbox.y, 0.0f);
+                EXPECT_LE(det.bbox.x + det.bbox.width, static_cast<float>(real_frame.cols) + 1e-2f);
+                EXPECT_LE(det.bbox.y + det.bbox.height,
+                          static_cast<float>(real_frame.rows) + 1e-2f);
+            }
+        }
     }
 }

@@ -1,0 +1,28 @@
+{
+  "overall": {
+    "precision": 0.9181,
+    "recall": 0.771,
+    "mAP50": 0.834,
+    "mAP50_95": 0.6174
+  },
+  "per_class": {
+    "person": {
+      "precision": 0.866,
+      "recall": 0.5779,
+      "mAP50": 0.6768,
+      "mAP50_95": 0.4233
+    },
+    "helmet": {
+      "precision": 0.9362,
+      "recall": 0.8027,
+      "mAP50": 0.8711,
+      "mAP50_95": 0.6667
+    },
+    "vest": {
+      "precision": 0.9522,
+      "recall": 0.9324,
+      "mAP50": 0.9541,
+      "mAP50_95": 0.7623
+    }
+  }
+}
